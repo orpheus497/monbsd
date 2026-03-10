@@ -297,9 +297,9 @@ void gather_data(struct mon_data *d) {
     static int soft_ticks = 0;
     if (soft_ticks-- <= 0) {
         soft_ticks = 10;
-        FILE *fp = popen("/usr/sbin/pkg info -q 2>/dev/null | wc -l", "r");
+        FILE *fp = popen("/usr/sbin/pkg info -q 2>/dev/null | /usr/bin/wc -l", "r");
         if (fp) { fscanf(fp, "%d", &d->pkg_count); pclose(fp); }
-        fp = popen("/usr/sbin/pkg query '%r' 2>/dev/null | grep -ic 'local'", "r");
+        fp = popen("/usr/sbin/pkg query '%r' 2>/dev/null | /usr/bin/grep -ic 'local'", "r");
         if (fp) { fscanf(fp, "%d", &d->ports_count); pclose(fp); }
         d->linux_count = 0;
         DIR *dir = opendir("/compat/linux/usr/bin");
