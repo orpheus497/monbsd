@@ -24,9 +24,17 @@ ${_test}: ${_test}.c
 clean:
 	rm -f ${TARGET} ${TESTS}
 
-.PHONY: all clean install uninstall tests
+purge: clean
+	rm -f ${BINDIR}/${TARGET}
+	rm -f ${MANDIR}/${TARGET}.8
+	rm -f ~/.local/bin/${TARGET}
+	@echo "All monbsd binaries and man pages purged from system and local paths."
+
+.PHONY: all clean install uninstall tests purge
 
 install: ${TARGET}
+	mkdir -p ${BINDIR}
+	mkdir -p ${MANDIR}
 	install -m 4755 -o root -g wheel ${TARGET} ${BINDIR}/${TARGET}
 	install -m 444 monbsd.8 ${MANDIR}/monbsd.8
 	@echo "monbsd installed to ${BINDIR}/${TARGET} with setuid root."

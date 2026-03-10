@@ -466,7 +466,6 @@ void gather_data(struct mon_data *d) {
         if (targets[j][0] == '\0') continue;
         for (int i = 0; i < nfs && d->disk_count < MAX_DISKS; i++) {
             if (strcmp(fs[i].f_mntonname, targets[j]) == 0) {
-                if (strcmp(targets[j], "/home") == 0 && strcmp(home_path, "/home") != 0) continue;
                 strcpy(d->disks[d->disk_count].mount, fs[i].f_mntonname);
                 d->disks[d->disk_count].total_bytes = (long long)fs[i].f_blocks * fs[i].f_bsize;
                 d->disks[d->disk_count].used_bytes = (long long)(fs[i].f_blocks - fs[i].f_bfree) * fs[i].f_bsize;
