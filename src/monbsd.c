@@ -297,9 +297,9 @@ void gather_data(struct mon_data *d) {
     static int soft_ticks = 0;
     if (soft_ticks-- <= 0) {
         soft_ticks = 10;
-        FILE *fp = popen("pkg info -q 2>/dev/null | wc -l", "r");
+        FILE *fp = popen("/usr/sbin/pkg info -q 2>/dev/null | wc -l", "r");
         if (fp) { fscanf(fp, "%d", &d->pkg_count); pclose(fp); }
-        fp = popen("pkg query '%r' 2>/dev/null | grep -ic 'local'", "r");
+        fp = popen("/usr/sbin/pkg query '%r' 2>/dev/null | grep -ic 'local'", "r");
         if (fp) { fscanf(fp, "%d", &d->ports_count); pclose(fp); }
         d->linux_count = 0;
         DIR *dir = opendir("/compat/linux/usr/bin");
@@ -323,8 +323,8 @@ void gather_data(struct mon_data *d) {
     size = sizeof(d->cx_usage);
     if (sysctlbyname("dev.cpu.0.cx_usage", d->cx_usage, &size, NULL, 0) != 0) strcpy(d->cx_usage, "N/A");
 
-    d->powerd_running = (system("pgrep -q -x powerd || pgrep -x powerd >/dev/null 2>&1") == 0);
-    d->powerdxx_running = (system("pgrep -q -x powerdxx || pgrep -x powerdxx >/dev/null 2>&1") == 0);
+    d->powerd_running = (system("/usr/bin/pgrep -q -x powerd || /usr/bin/pgrep -x powerd >/dev/null 2>&1") == 0);
+    d->powerdxx_running = (system("/usr/bin/pgrep -q -x powerdxx || /usr/bin/pgrep -x powerdxx >/dev/null 2>&1") == 0);
 
     size = sizeof(itmp);
     if (sysctlbyname("hw.acpi.battery.state", &itmp, &size, NULL, 0) == 0) {
@@ -348,7 +348,7 @@ void gather_data(struct mon_data *d) {
         } g_cache[MAX_GPUS];
         static int g_init = 0;
         if (!g_init) {
-            FILE *fp = popen("pciconf -lv 2>/dev/null | grep -A 2 'class=0x03'", "r");
+            FILE *fp = popen("/usr/sbin/pciconf -lv 2>/dev/null | grep -A 2 'class=0x03'", "r");
             if (fp) {
                 char line[256];
                 int g_count = 0;
@@ -444,7 +444,7 @@ void gather_data(struct mon_data *d) {
     }
     history[hist_idx].ts = ts; history[hist_idx].valid = 1; hist_idx = (hist_idx + 1) % HISTORY_SIZE;
 
-    FILE *fsw = popen("swapinfo -k 2>/dev/null", "r"); d->swap_total = d->swap_used = 0;
+    FILE *fsw = popen("/usr/sbin/swapinfo -k 2>/dev/null", "r"); d->swap_total = d->swap_used = 0;
     if (fsw) { char line[256]; fgets(line, 256, fsw); while (fgets(line, 256, fsw)) { long t, u; if (sscanf(line, "%*s %ld %ld", &t, &u) == 2) { d->swap_total += (long long)t * 1024; d->swap_used += (long long)u * 1024; } } pclose(fsw); }
     d->swap_usage = (d->swap_total > 0) ? (100.0 * d->swap_used / d->swap_total) : 0;
 
