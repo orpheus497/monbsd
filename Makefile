@@ -28,8 +28,12 @@ purge: uninstall clean
 	@echo "All monbsd binaries and man pages purged from system paths."
 
 uninstall-user:
-	rm -f ${HOME}/.local/bin/${TARGET}
-	@echo "monbsd removed from ${HOME}/.local/bin/."
+	@if [ -n "$$HOME" ]; then \
+		rm -f "$$HOME/.local/bin/${TARGET}"; \
+		echo "monbsd removed from $$HOME/.local/bin/."; \
+	else \
+		echo "\$$HOME is not set or empty; skipping user uninstall."; \
+	fi
 
 .PHONY: all clean install uninstall uninstall-user tests purge
 
