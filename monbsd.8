@@ -1,0 +1,63 @@
+.Dd March 11, 2026
+.Dt MONBSD 8
+.Os
+.Sh NAME
+.Nm monbsd
+.Nd system monitor for FreeBSD laptops
+.Sh SYNOPSIS
+.Nm
+.Sh DESCRIPTION
+.Nm
+is a lightweight terminal-based system monitor specifically designed for FreeBSD laptops.
+It provides granular monitoring of system health, focusing on thermal performance,
+power management, and hardware status.
+.Pp
+The following information is displayed:
+.Bl -bullet -offset indent
+.It
+System uptime, load average, and CPU model.
+.It
+Real-time CPU and GPU temperatures.
+.It
+CPU frequency and core usage.
+.It
+Memory and swap usage.
+.It
+Network interface RX/TX rates.
+.It
+Disk usage for common mount points.
+.It
+ACPI states, battery status, and fan speed (where supported).
+.It
+Counts of installed packages and ports.
+.El
+.Sh FILES
+.Bl -tag -width "/dev/cpuctl0" -compact
+.It Pa /dev/cpuctl*
+Used for direct MSR access to read CPU temperature and performance counters.
+.It Pa /dev/io
+Used for direct PCI configuration space access.
+.El
+.Sh PRIVILEGES
+.Nm
+requires access to
+.Pa /dev/cpuctl0
+and
+.Pa /dev/io .
+It is typically installed with setuid root or must be run via
+.Xr sudo 8 .
+.Sh INTERACTIVE COMMANDS
+The following keys can be used while
+.Nm
+is running:
+.Bl -tag -width "q, Q, Ctrl+C" -compact
+.It Ic q, Q, Ctrl+C
+Exit the program.
+.El
+.Sh SEE ALSO
+.Xr sysctl 8 ,
+.Xr pciconf 8 ,
+.Xr pkg 8 ,
+.Xr powerd 8
+.Sh AUTHORS
+.An orpheus497
