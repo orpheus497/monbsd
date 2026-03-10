@@ -348,7 +348,7 @@ void gather_data(struct mon_data *d) {
         } g_cache[MAX_GPUS];
         static int g_init = 0;
         if (!g_init) {
-            FILE *fp = popen("/usr/sbin/pciconf -lv 2>/dev/null | grep -A 2 'class=0x03'", "r");
+            FILE *fp = popen("/usr/sbin/pciconf -lv 2>/dev/null | /usr/bin/grep -A 2 'class=0x03'", "r");
             if (fp) {
                 char line[256];
                 int g_count = 0;
