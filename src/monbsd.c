@@ -613,8 +613,12 @@ int main() {
                 char *endp;
                 errno = 0;
                 unsigned long v = strtoul(sudo_uid_str, &endp, 10);
-                if (errno != ERANGE && *endp == '\0' && v <= (unsigned long)((uid_t)-1))
+                if (errno == 0 &&
+                    endp != sudo_uid_str &&
+                    *endp == '\0' &&
+                    v <= (unsigned long)((uid_t)-1)) {
                     target_uid = (uid_t)v;
+                }
             }
         }
         struct passwd *pw = getpwuid(target_uid);
