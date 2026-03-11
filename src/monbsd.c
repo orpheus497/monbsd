@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
@@ -24,6 +25,7 @@
 #include <ifaddrs.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <pwd.h>
 
 #define VERSION "0.1.0"
 #define HISTORY_SIZE 10
@@ -94,6 +96,7 @@ struct mon_data {
     double swap_usage;
     struct disk_entry disks[MAX_DISKS];
     int disk_count;
+    char home_path[MAXPATHLEN];
 };
 
 struct iface_history {
@@ -297,9 +300,9 @@ void gather_data(struct mon_data *d) {
     static int soft_ticks = 0;
     if (soft_ticks-- <= 0) {
         soft_ticks = 10;
-        FILE *fp = popen("pkg info -q 2>/dev/null | wc -l", "r");
+        FILE *fp = popen("/usr/local/sbin/pkg info -q 2>/dev/null | /usr/bin/wc -l", "r");
         if (fp) { fscanf(fp, "%d", &d->pkg_count); pclose(fp); }
-        fp = popen("pkg query '%r' 2>/dev/null | grep -ic 'local'", "r");
+        fp = popen("/usr/local/sbin/pkg query '%r' 2>/dev/null | /usr/bin/grep -ic 'local'", "r");
         if (fp) { fscanf(fp, "%d", &d->ports_count); pclose(fp); }
         d->linux_count = 0;
         DIR *dir = opendir("/compat/linux/usr/bin");
@@ -323,8 +326,12 @@ void gather_data(struct mon_data *d) {
     size = sizeof(d->cx_usage);
     if (sysctlbyname("dev.cpu.0.cx_usage", d->cx_usage, &size, NULL, 0) != 0) strcpy(d->cx_usage, "N/A");
 
-    d->powerd_running = (system("pgrep -q -x powerd || pgrep -x powerd >/dev/null 2>&1") == 0);
-    d->powerdxx_running = (system("pgrep -q -x powerdxx || pgrep -x powerdxx >/dev/null 2>&1") == 0);
+    /* TODO: replace remaining shell-based execution (system() and popen() calls in gather_data())
+     * with fork()/execve() using an explicitly constructed environ[] for maximum safety in a
+     * setuid binary (see powerd_running, powerdxx_running, and all popen() call sites), and
+     * track this work in a dedicated issue so it is not overlooked. */
+    d->powerd_running = (system("/usr/bin/pgrep -q -x powerd || /usr/bin/pgrep -x powerd >/dev/null 2>&1") == 0);
+    d->powerdxx_running = (system("/usr/bin/pgrep -q -x powerdxx || /usr/bin/pgrep -x powerdxx >/dev/null 2>&1") == 0);
 
     size = sizeof(itmp);
     if (sysctlbyname("hw.acpi.battery.state", &itmp, &size, NULL, 0) == 0) {
@@ -348,7 +355,7 @@ void gather_data(struct mon_data *d) {
         } g_cache[MAX_GPUS];
         static int g_init = 0;
         if (!g_init) {
-            FILE *fp = popen("pciconf -lv 2>/dev/null | grep -A 2 'class=0x03'", "r");
+            FILE *fp = popen("/usr/sbin/pciconf -lv 2>/dev/null | /usr/bin/grep -A 2 'class=0x03'", "r");
             if (fp) {
                 char line[256];
                 int g_count = 0;
@@ -444,7 +451,7 @@ void gather_data(struct mon_data *d) {
     }
     history[hist_idx].ts = ts; history[hist_idx].valid = 1; hist_idx = (hist_idx + 1) % HISTORY_SIZE;
 
-    FILE *fsw = popen("swapinfo -k 2>/dev/null", "r"); d->swap_total = d->swap_used = 0;
+    FILE *fsw = popen("/usr/sbin/swapinfo -k 2>/dev/null", "r"); d->swap_total = d->swap_used = 0;
     if (fsw) { char line[256]; fgets(line, 256, fsw); while (fgets(line, 256, fsw)) { long t, u; if (sscanf(line, "%*s %ld %ld", &t, &u) == 2) { d->swap_total += (long long)t * 1024; d->swap_used += (long long)u * 1024; } } pclose(fsw); }
     d->swap_usage = (d->swap_total > 0) ? (100.0 * d->swap_used / d->swap_total) : 0;
 
@@ -452,21 +459,11 @@ void gather_data(struct mon_data *d) {
     struct statfs *fs = malloc(sizeof(struct statfs) * nfs);
     nfs = getfsstat(fs, sizeof(struct statfs) * nfs, MNT_NOWAIT);
     d->disk_count = 0;
-    char home_path[MAXPATHLEN] = "";
-    const char *s_user = getenv("SUDO_USER");
-    const char *u_user = getenv("USER");
-    if (s_user) snprintf(home_path, sizeof(home_path), "/home/%s", s_user);
-    else if (u_user && strcmp(u_user, "root") != 0) snprintf(home_path, sizeof(home_path), "/home/%s", u_user);
-    else {
-        const char *h_env = getenv("HOME");
-        if (h_env) strncpy(home_path, h_env, sizeof(home_path)-1);
-    }
-    const char *targets[] = {"/", "/boot/efi", "/tmp", "/zroot", home_path};
+    const char *targets[] = {"/", "/boot/efi", "/tmp", "/zroot", d->home_path};
     for (int j = 0; j < 5; j++) {
         if (targets[j][0] == '\0') continue;
         for (int i = 0; i < nfs && d->disk_count < MAX_DISKS; i++) {
             if (strcmp(fs[i].f_mntonname, targets[j]) == 0) {
-                if (strcmp(targets[j], "/home") == 0 && strcmp(home_path, "/home") != 0) continue;
                 strcpy(d->disks[d->disk_count].mount, fs[i].f_mntonname);
                 d->disks[d->disk_count].total_bytes = (long long)fs[i].f_blocks * fs[i].f_bsize;
                 d->disks[d->disk_count].used_bytes = (long long)(fs[i].f_blocks - fs[i].f_bfree) * fs[i].f_bsize;
@@ -600,7 +597,70 @@ void render(struct mon_data *d) {
 }
 
 int main() {
+    /* Resolve the real user's home directory from the system user database
+     * before sanitizing the environment.  When running under sudo, SUDO_UID
+     * identifies the invoking user; otherwise the process's real UID is used.
+     * Using getpwuid() avoids trusting attacker-controlled environment
+     * variables (HOME/USER/SUDO_USER) in a setuid-root binary. */
+    char resolved_home[MAXPATHLEN] = "";
+    {
+        uid_t target_uid = getuid();
+        /* Only trust SUDO_UID when running as root; an unprivileged caller
+         * must not be able to influence which home directory is monitored. */
+        if (target_uid == 0) {
+            const char *sudo_uid_str = getenv("SUDO_UID");
+            if (sudo_uid_str != NULL) {
+                char *endp;
+                errno = 0;
+                unsigned long v = strtoul(sudo_uid_str, &endp, 10);
+                if (errno == 0 &&
+                    endp != sudo_uid_str &&
+                    *endp == '\0' &&
+                    v <= (unsigned long)((uid_t)-1)) {
+                    target_uid = (uid_t)v;
+                }
+            }
+        }
+        struct passwd *pw = getpwuid(target_uid);
+        if (pw != NULL && pw->pw_dir != NULL) {
+            /* Disk matching compares against f_mntonname (the mountpoint), not
+             * the home directory path itself.  Use statfs() to find the
+             * mountpoint that contains the home directory. */
+            struct statfs home_fs;
+            if (statfs(pw->pw_dir, &home_fs) == 0) {
+                /* Avoid setting resolved_home to "/" when the home directory
+                 * lives on the root filesystem, since "/" is already a
+                 * monitored target and would otherwise be added twice. */
+                if (!(home_fs.f_mntonname[0] == '/' && home_fs.f_mntonname[1] == '\0')) {
+                    strncpy(resolved_home, home_fs.f_mntonname, sizeof(resolved_home) - 1);
+                }
+            } else {
+                /* Fallback: use the home directory path itself, but likewise
+                 * skip it if it is exactly "/". */
+                if (!(pw->pw_dir[0] == '/' && pw->pw_dir[1] == '\0')) {
+                    strncpy(resolved_home, pw->pw_dir, sizeof(resolved_home) - 1);
+                }
+            }
+        }
+    }
+
+    /* Sanitize environment for setuid safety: use an allowlist approach so no
+     * dangerous variable (LD_*, IFS, ENV, BASH_ENV, locale, etc.) is missed.
+     * Only TERM is restored; home-directory detection uses resolved_home which
+     * was derived from the user database, not the environment. */
+    const char *term_env = getenv("TERM");
+    /* Bound TERM to a reasonable length to prevent DoS via oversized values. */
+    char *term = (term_env != NULL) ? strndup(term_env, 64) : NULL;
+    if (clearenv() != 0 ||
+        setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/sbin", 1) != 0 ||
+        (term != NULL && setenv("TERM", term, 1) != 0)) {
+        fprintf(stderr, "Failed to sanitize environment: %s\n", strerror(errno));
+        free(term);
+        exit(1);
+    }
+    free(term);
     struct mon_data d = {0};
+    strncpy(d.home_path, resolved_home, sizeof(d.home_path) - 1);
     enable_raw_mode();
     signal(SIGWINCH, handle_sigwinch);
     get_terminal_size();
