@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
@@ -323,6 +324,8 @@ void gather_data(struct mon_data *d) {
     size = sizeof(d->cx_usage);
     if (sysctlbyname("dev.cpu.0.cx_usage", d->cx_usage, &size, NULL, 0) != 0) strcpy(d->cx_usage, "N/A");
 
+    /* TODO: replace system() with fork()/execve() using an explicitly constructed environ[]
+     * for maximum safety in a setuid binary (see powerd_running and powerdxx_running). */
     d->powerd_running = (system("/usr/bin/pgrep -q -x powerd || /usr/bin/pgrep -x powerd >/dev/null 2>&1") == 0);
     d->powerdxx_running = (system("/usr/bin/pgrep -q -x powerdxx || /usr/bin/pgrep -x powerdxx >/dev/null 2>&1") == 0);
 
@@ -599,6 +602,22 @@ void render(struct mon_data *d) {
 }
 
 int main() {
+    /* Sanitize environment for setuid safety */
+    if (setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin", 1) != 0 ||
+        unsetenv("IFS") != 0 ||
+        unsetenv("LD_PRELOAD") != 0 ||
+        unsetenv("LD_LIBRARY_PATH") != 0 ||
+        unsetenv("LD_LIBMAP") != 0 ||
+        unsetenv("LD_LIBMAP_DISABLE") != 0 ||
+        unsetenv("LD_DEBUG") != 0 ||
+        unsetenv("LANG") != 0 ||
+        unsetenv("LC_ALL") != 0 ||
+        unsetenv("LC_CTYPE") != 0 ||
+        unsetenv("LC_MESSAGES") != 0 ||
+        unsetenv("NLSPATH") != 0) {
+        fprintf(stderr, "Failed to sanitize environment: %s\n", strerror(errno));
+        exit(1);
+    }
     struct mon_data d = {0};
     enable_raw_mode();
     signal(SIGWINCH, handle_sigwinch);
