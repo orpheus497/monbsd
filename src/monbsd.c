@@ -623,10 +623,20 @@ int main() {
              * the home directory path itself.  Use statfs() to find the
              * mountpoint that contains the home directory. */
             struct statfs home_fs;
-            if (statfs(pw->pw_dir, &home_fs) == 0)
-                strncpy(resolved_home, home_fs.f_mntonname, sizeof(resolved_home) - 1);
-            else
-                strncpy(resolved_home, pw->pw_dir, sizeof(resolved_home) - 1);
+            if (statfs(pw->pw_dir, &home_fs) == 0) {
+                /* Avoid setting resolved_home to "/" when the home directory
+                 * lives on the root filesystem, since "/" is already a
+                 * monitored target and would otherwise be added twice. */
+                if (!(home_fs.f_mntonname[0] == '/' && home_fs.f_mntonname[1] == '\0')) {
+                    strncpy(resolved_home, home_fs.f_mntonname, sizeof(resolved_home) - 1);
+                }
+            } else {
+                /* Fallback: use the home directory path itself, but likewise
+                 * skip it if it is exactly "/". */
+                if (!(pw->pw_dir[0] == '/' && pw->pw_dir[1] == '\0')) {
+                    strncpy(resolved_home, pw->pw_dir, sizeof(resolved_home) - 1);
+                }
+            }
         }
     }
 
