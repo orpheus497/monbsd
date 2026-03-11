@@ -25,6 +25,7 @@
 #include <ifaddrs.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <pwd.h>
 
 #define VERSION "0.1.0"
 #define HISTORY_SIZE 10
@@ -95,6 +96,7 @@ struct mon_data {
     double swap_usage;
     struct disk_entry disks[MAX_DISKS];
     int disk_count;
+    char home_path[MAXPATHLEN];
 };
 
 struct iface_history {
@@ -457,16 +459,7 @@ void gather_data(struct mon_data *d) {
     struct statfs *fs = malloc(sizeof(struct statfs) * nfs);
     nfs = getfsstat(fs, sizeof(struct statfs) * nfs, MNT_NOWAIT);
     d->disk_count = 0;
-    char home_path[MAXPATHLEN] = "";
-    const char *s_user = getenv("SUDO_USER");
-    const char *u_user = getenv("USER");
-    if (s_user) snprintf(home_path, sizeof(home_path), "/home/%s", s_user);
-    else if (u_user && strcmp(u_user, "root") != 0) snprintf(home_path, sizeof(home_path), "/home/%s", u_user);
-    else {
-        const char *h_env = getenv("HOME");
-        if (h_env) strncpy(home_path, h_env, sizeof(home_path)-1);
-    }
-    const char *targets[] = {"/", "/boot/efi", "/tmp", "/zroot", home_path};
+    const char *targets[] = {"/", "/boot/efi", "/tmp", "/zroot", d->home_path};
     for (int j = 0; j < 5; j++) {
         if (targets[j][0] == '\0') continue;
         for (int i = 0; i < nfs && d->disk_count < MAX_DISKS; i++) {
@@ -604,12 +597,36 @@ void render(struct mon_data *d) {
 }
 
 int main() {
+    /* Resolve the real user's home directory from the system user database
+     * before sanitizing the environment.  When running under sudo, SUDO_UID
+     * identifies the invoking user; otherwise the process's real UID is used.
+     * Using getpwuid() avoids trusting attacker-controlled environment
+     * variables (HOME/USER/SUDO_USER) in a setuid-root binary. */
+    char resolved_home[MAXPATHLEN] = "";
+    {
+        uid_t target_uid = getuid();
+        const char *sudo_uid_str = getenv("SUDO_UID");
+        if (sudo_uid_str != NULL) {
+            char *endp;
+            errno = 0;
+            unsigned long v = strtoul(sudo_uid_str, &endp, 10);
+            if (errno != ERANGE && *endp == '\0' && v <= (unsigned long)((uid_t)-1))
+                target_uid = (uid_t)v;
+        }
+        struct passwd *pw = getpwuid(target_uid);
+        if (pw != NULL && pw->pw_dir != NULL)
+            strncpy(resolved_home, pw->pw_dir, sizeof(resolved_home) - 1);
+    }
+
     /* Sanitize environment for setuid safety: use an allowlist approach so no
-     * dangerous variable (LD_*, IFS, ENV, BASH_ENV, locale, etc.) is missed. */
-    char *term_env = getenv("TERM");
-    char *term = term_env ? strdup(term_env) : NULL;
+     * dangerous variable (LD_*, IFS, ENV, BASH_ENV, locale, etc.) is missed.
+     * Only TERM is restored; home-directory detection uses resolved_home which
+     * was derived from the user database, not the environment. */
+    const char *term_env = getenv("TERM");
+    /* Bound TERM to a reasonable length to prevent DoS via oversized values. */
+    char *term = (term_env != NULL) ? strndup(term_env, 64) : NULL;
     if (clearenv() != 0 ||
-        setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin", 1) != 0 ||
+        setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/sbin", 1) != 0 ||
         (term != NULL && setenv("TERM", term, 1) != 0)) {
         fprintf(stderr, "Failed to sanitize environment: %s\n", strerror(errno));
         free(term);
@@ -617,6 +634,7 @@ int main() {
     }
     free(term);
     struct mon_data d = {0};
+    strncpy(d.home_path, resolved_home, sizeof(d.home_path) - 1);
     enable_raw_mode();
     signal(SIGWINCH, handle_sigwinch);
     get_terminal_size();
