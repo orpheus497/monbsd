@@ -605,17 +605,34 @@ void render(struct mon_data *d) {
 
 int main() {
     /* Sanitize environment for setuid safety: use an allowlist approach so no
-     * dangerous variable (LD_*, IFS, ENV, BASH_ENV, locale, etc.) is missed. */
+     * dangerous variable (LD_*, IFS, ENV, BASH_ENV, locale, etc.) is missed.
+     * Preserve TERM, SUDO_USER, USER, and HOME so the terminal and home-
+     * directory detection in gather_data() continue to work after clearenv(). */
     char *term_env = getenv("TERM");
     char *term = term_env ? strdup(term_env) : NULL;
+    char *sudo_user_env = getenv("SUDO_USER");
+    char *sudo_user = sudo_user_env ? strdup(sudo_user_env) : NULL;
+    char *user_env = getenv("USER");
+    char *user = user_env ? strdup(user_env) : NULL;
+    char *home_env = getenv("HOME");
+    char *home = home_env ? strdup(home_env) : NULL;
     if (clearenv() != 0 ||
-        setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin", 1) != 0 ||
-        (term != NULL && setenv("TERM", term, 1) != 0)) {
+        setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/sbin", 1) != 0 ||
+        (term != NULL && setenv("TERM", term, 1) != 0) ||
+        (sudo_user != NULL && setenv("SUDO_USER", sudo_user, 1) != 0) ||
+        (user != NULL && setenv("USER", user, 1) != 0) ||
+        (home != NULL && setenv("HOME", home, 1) != 0)) {
         fprintf(stderr, "Failed to sanitize environment: %s\n", strerror(errno));
         free(term);
+        free(sudo_user);
+        free(user);
+        free(home);
         exit(1);
     }
     free(term);
+    free(sudo_user);
+    free(user);
+    free(home);
     struct mon_data d = {0};
     enable_raw_mode();
     signal(SIGWINCH, handle_sigwinch);
