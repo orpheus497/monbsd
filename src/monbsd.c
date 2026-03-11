@@ -605,17 +605,43 @@ int main() {
     char resolved_home[MAXPATHLEN] = "";
     {
         uid_t target_uid = getuid();
-        const char *sudo_uid_str = getenv("SUDO_UID");
-        if (sudo_uid_str != NULL) {
-            char *endp;
-            errno = 0;
-            unsigned long v = strtoul(sudo_uid_str, &endp, 10);
-            if (errno != ERANGE && *endp == '\0' && v <= (unsigned long)((uid_t)-1))
-                target_uid = (uid_t)v;
+        /* Only trust SUDO_UID when running as root; an unprivileged caller
+         * must not be able to influence which home directory is monitored. */
+        if (target_uid == 0) {
+            const char *sudo_uid_str = getenv("SUDO_UID");
+            if (sudo_uid_str != NULL) {
+                char *endp;
+                errno = 0;
+                unsigned long v = strtoul(sudo_uid_str, &endp, 10);
+                if (errno == 0 &&
+                    endp != sudo_uid_str &&
+                    *endp == '\0' &&
+                    v <= (unsigned long)((uid_t)-1)) {
+                    target_uid = (uid_t)v;
+                }
+            }
         }
         struct passwd *pw = getpwuid(target_uid);
-        if (pw != NULL && pw->pw_dir != NULL)
-            strncpy(resolved_home, pw->pw_dir, sizeof(resolved_home) - 1);
+        if (pw != NULL && pw->pw_dir != NULL) {
+            /* Disk matching compares against f_mntonname (the mountpoint), not
+             * the home directory path itself.  Use statfs() to find the
+             * mountpoint that contains the home directory. */
+            struct statfs home_fs;
+            if (statfs(pw->pw_dir, &home_fs) == 0) {
+                /* Avoid setting resolved_home to "/" when the home directory
+                 * lives on the root filesystem, since "/" is already a
+                 * monitored target and would otherwise be added twice. */
+                if (!(home_fs.f_mntonname[0] == '/' && home_fs.f_mntonname[1] == '\0')) {
+                    strncpy(resolved_home, home_fs.f_mntonname, sizeof(resolved_home) - 1);
+                }
+            } else {
+                /* Fallback: use the home directory path itself, but likewise
+                 * skip it if it is exactly "/". */
+                if (!(pw->pw_dir[0] == '/' && pw->pw_dir[1] == '\0')) {
+                    strncpy(resolved_home, pw->pw_dir, sizeof(resolved_home) - 1);
+                }
+            }
+        }
     }
 
     /* Sanitize environment for setuid safety: use an allowlist approach so no
