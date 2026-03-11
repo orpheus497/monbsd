@@ -24,13 +24,18 @@ ${_test}: ${_test}.c
 clean:
 	rm -f ${TARGET} ${TESTS}
 
-purge: clean
-	rm -f ${BINDIR}/${TARGET}
-	rm -f ${MANDIR}/${TARGET}.8
-	rm -f ~/.local/bin/${TARGET}
-	@echo "All monbsd binaries and man pages purged from system and local paths."
+purge: uninstall clean
+	@echo "All monbsd binaries and man pages purged from system paths."
 
-.PHONY: all clean install uninstall tests purge
+uninstall-user:
+	@if [ -n "$$HOME" ]; then \
+		rm -f "$$HOME/.local/bin/${TARGET}"; \
+		echo "monbsd removed from $$HOME/.local/bin/."; \
+	else \
+		echo "\$$HOME is not set or empty; skipping user uninstall."; \
+	fi
+
+.PHONY: all clean install uninstall uninstall-user tests purge
 
 install: ${TARGET}
 	mkdir -p ${BINDIR}
@@ -43,5 +48,3 @@ install: ${TARGET}
 uninstall:
 	rm -f ${BINDIR}/${TARGET}
 	rm -f ${MANDIR}/monbsd.8
-
-.PHONY: all clean install uninstall
