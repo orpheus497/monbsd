@@ -324,8 +324,10 @@ void gather_data(struct mon_data *d) {
     size = sizeof(d->cx_usage);
     if (sysctlbyname("dev.cpu.0.cx_usage", d->cx_usage, &size, NULL, 0) != 0) strcpy(d->cx_usage, "N/A");
 
-    /* TODO: replace system() with fork()/execve() using an explicitly constructed environ[]
-     * for maximum safety in a setuid binary (see powerd_running and powerdxx_running). */
+    /* TODO: replace remaining shell-based execution (system() and popen() calls in gather_data())
+     * with fork()/execve() using an explicitly constructed environ[] for maximum safety in a
+     * setuid binary (see powerd_running, powerdxx_running, and all popen() call sites), and
+     * track this work in a dedicated issue so it is not overlooked. */
     d->powerd_running = (system("/usr/bin/pgrep -q -x powerd || /usr/bin/pgrep -x powerd >/dev/null 2>&1") == 0);
     d->powerdxx_running = (system("/usr/bin/pgrep -q -x powerdxx || /usr/bin/pgrep -x powerdxx >/dev/null 2>&1") == 0);
 
@@ -602,22 +604,18 @@ void render(struct mon_data *d) {
 }
 
 int main() {
-    /* Sanitize environment for setuid safety */
-    if (setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin", 1) != 0 ||
-        unsetenv("IFS") != 0 ||
-        unsetenv("LD_PRELOAD") != 0 ||
-        unsetenv("LD_LIBRARY_PATH") != 0 ||
-        unsetenv("LD_LIBMAP") != 0 ||
-        unsetenv("LD_LIBMAP_DISABLE") != 0 ||
-        unsetenv("LD_DEBUG") != 0 ||
-        unsetenv("LANG") != 0 ||
-        unsetenv("LC_ALL") != 0 ||
-        unsetenv("LC_CTYPE") != 0 ||
-        unsetenv("LC_MESSAGES") != 0 ||
-        unsetenv("NLSPATH") != 0) {
+    /* Sanitize environment for setuid safety: use an allowlist approach so no
+     * dangerous variable (LD_*, IFS, ENV, BASH_ENV, locale, etc.) is missed. */
+    char *term_env = getenv("TERM");
+    char *term = term_env ? strdup(term_env) : NULL;
+    if (clearenv() != 0 ||
+        setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin", 1) != 0 ||
+        (term != NULL && setenv("TERM", term, 1) != 0)) {
         fprintf(stderr, "Failed to sanitize environment: %s\n", strerror(errno));
+        free(term);
         exit(1);
     }
+    free(term);
     struct mon_data d = {0};
     enable_raw_mode();
     signal(SIGWINCH, handle_sigwinch);
