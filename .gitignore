@@ -1,0 +1,30 @@
+# Binaries
+monbsd
+mon_old/monbsd
+
+# Object files
+*.o
+src/*.o
+mon_old/src/*.o
+
+# Test binaries
+tests/test_aperf
+tests/test_compile
+tests/test_cpuctl
+tests/test_cpuid
+tests/test_pci
+tests/test_statfs
+tests/test_uptime
+mon_old/tests/test_aperf
+mon_old/tests/test_compile
+mon_old/tests/test_cpuctl
+mon_old/tests/test_cpuid
+mon_old/tests/test_pci
+mon_old/tests/test_statfs
+mon_old/tests/test_uptime
+
+# Editor backups and temporary files
+*~
+*.swp
+*.core
+.DS_Store
