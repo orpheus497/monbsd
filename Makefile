@@ -8,7 +8,7 @@ CFLAGS = -Wall -Wextra -Werror -Iinclude -O2
 # 2. PROJECT FILES
 # =========================================================================
 TARGET = monbsd
-SRCS = src/main.c src/hw_pci.c   
+SRCS = src/main.c src/hw_pci.c src/sensors_os.c   
 OBJS = ${SRCS:.c=.o}
 
 # =========================================================================
