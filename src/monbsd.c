@@ -74,6 +74,7 @@ struct mon_data {
     long long mem_total, mem_used;
     double mem_usage;
     int pkg_count, ports_count, linux_count;
+    int user_bin_count;
     int pci_device_count;
 
     double cpu_temp;
@@ -101,6 +102,7 @@ struct mon_data {
     struct disk_entry disks[MAX_DISKS];
     int disk_count;
     char home_path[MAXPATHLEN];
+    char home_dir[MAXPATHLEN];
 };
 
 struct iface_history {
@@ -248,6 +250,25 @@ int direct_pci_count() {
     return count;
 }
 
+static int count_dir_executables(const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir) return 0;
+    int count = 0;
+    struct dirent *e;
+    char full[MAXPATHLEN];
+    while ((e = readdir(dir))) {
+        if (e->d_name[0] == '.') continue;
+        snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
+        if (access(full, X_OK) == 0) {
+            struct stat st;
+            if (stat(full, &st) == 0 && S_ISREG(st.st_mode))
+                count++;
+        }
+    }
+    closedir(dir);
+    return count;
+}
+
 void gather_data(struct mon_data *d) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
@@ -312,6 +333,17 @@ void gather_data(struct mon_data *d) {
         DIR *dir = opendir("/compat/linux/usr/bin");
         if (dir) { struct dirent *e; while ((e = readdir(dir))) if (e->d_name[0] != '.') d->linux_count++; closedir(dir); }
         d->pci_device_count = direct_pci_count();
+
+        d->user_bin_count = 0;
+        if (d->home_dir[0]) {
+            char probe[MAXPATHLEN];
+            snprintf(probe, sizeof(probe), "%s/.local/bin", d->home_dir);
+            d->user_bin_count += count_dir_executables(probe);
+            snprintf(probe, sizeof(probe), "%s/bin", d->home_dir);
+            d->user_bin_count += count_dir_executables(probe);
+            snprintf(probe, sizeof(probe), "%s/local/bin", d->home_dir);
+            d->user_bin_count += count_dir_executables(probe);
+        }
     }
 
     d->cpu_temp = direct_cpu_temp();
@@ -349,85 +381,126 @@ void gather_data(struct mon_data *d) {
 
     size = sizeof(d->freq_levels); sysctlbyname("dev.cpu.0.freq_levels", d->freq_levels, &size, NULL, 0);
 
-    // GPU Monitoring - Live Update every 500ms
-    if (tick_count % 5 == 0) {
-        d->gpu_count = 0;
+    {
         static struct gpu_info_cache {
             char model[128];
-            int unit;
             int is_nvidia;
         } g_cache[MAX_GPUS];
+        static int g_cached_count = 0;
         static int g_init = 0;
-        static int has_nvidia_smi = -1; /* -1 = unchecked, 0 = absent, 1 = present */
+        static int has_nvidia_smi = -1;
+
         if (!g_init) {
-            FILE *fp = popen("/usr/sbin/pciconf -lv 2>/dev/null | /usr/bin/grep -A 2 'class=0x03'", "r");
+            FILE *fp = popen("/usr/sbin/pciconf -lv 2>/dev/null", "r");
             if (fp) {
                 char line[256];
-                int g_count = 0;
-                while (fgets(line, sizeof(line), fp) && g_count < MAX_GPUS) {
-                    if (strstr(line, "device     =")) {
+                int in_gpu = 0;
+                int pending_nvidia = 0;
+                while (fgets(line, sizeof(line), fp)) {
+                    if (strstr(line, "class=0x03")) {
+                        in_gpu = 1;
+                        pending_nvidia = 0;
+                        continue;
+                    }
+                    if (in_gpu && line[0] != ' ' && line[0] != '\t') {
+                        in_gpu = 0;
+                        pending_nvidia = 0;
+                    }
+                    if (!in_gpu) continue;
+                    if (strstr(line, "vendor") && strstr(line, "=")) {
+                        if (strstr(line, "NVIDIA") || strstr(line, "nvidia"))
+                            pending_nvidia = 1;
+                    }
+                    if (strstr(line, "device") && strstr(line, "=") && g_cached_count < MAX_GPUS) {
                         char *start = strchr(line, '\'');
                         if (start) {
                             char *end = strchr(start + 1, '\'');
                             if (end) {
                                 *end = '\0';
-                                strncpy(g_cache[g_count].model, start + 1, 127);
-                                g_cache[g_count].is_nvidia = (strstr(line, "NVIDIA") != NULL || strstr(g_cache[g_count].model, "NVIDIA") != NULL);
-                                g_cache[g_count].unit = g_count;
-                                g_count++;
+                                strncpy(g_cache[g_cached_count].model, start + 1, 127);
+                                g_cache[g_cached_count].model[127] = '\0';
+                                g_cache[g_cached_count].is_nvidia = pending_nvidia ||
+                                    (strstr(g_cache[g_cached_count].model, "NVIDIA") != NULL) ||
+                                    (strstr(g_cache[g_cached_count].model, "GeForce") != NULL) ||
+                                    (strstr(g_cache[g_cached_count].model, "Quadro") != NULL) ||
+                                    (strstr(g_cache[g_cached_count].model, "Tesla") != NULL);
+                                g_cached_count++;
+                                in_gpu = 0;
+                                pending_nvidia = 0;
                             }
                         }
                     }
                 }
                 pclose(fp);
-                d->gpu_count = g_count;
             }
-            /* One-time check: does nvidia-smi exist and is it executable? */
             if (has_nvidia_smi < 0) {
                 has_nvidia_smi = (access(NVIDIA_SMI_PATH, X_OK) == 0) ? 1 : 0;
             }
             g_init = 1;
-        } else {
-            // Count from cache
-            for(int i=0; i<MAX_GPUS; i++) if(g_cache[i].model[0]) d->gpu_count++;
         }
-        for (int i = 0; i < d->gpu_count; i++) {
-            strcpy(d->gpus[i].model, g_cache[i].model);
-            d->gpus[i].active = 1;
-            d->gpus[i].freq_mhz = 0; d->gpus[i].temp_c = -1;
-            d->gpus[i].util_pct = -1; d->gpus[i].vram_used_mib = -1; d->gpus[i].vram_total_mib = -1;
-            if (g_cache[i].is_nvidia) {
-                int got_smi = 0;
-                if (has_nvidia_smi) {
-                    FILE *fp = popen(NVIDIA_SMI_PATH
-                        " --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu"
-                        " --format=csv,noheader,nounits 2>/dev/null", "r");
-                    if (fp) {
-                        char sbuf[128];
-                        if (fgets(sbuf, sizeof(sbuf), fp)) {
-                            float util; int mem_used, mem_total, gtemp;
-                            if (sscanf(sbuf, " %f , %d , %d , %d", &util, &mem_used, &mem_total, &gtemp) == 4) {
-                                d->gpus[i].util_pct = util;
-                                d->gpus[i].vram_used_mib = mem_used;
-                                d->gpus[i].vram_total_mib = mem_total;
-                                d->gpus[i].temp_c = gtemp;
-                                got_smi = 1;
+        d->gpu_count = g_cached_count;
+
+        if (tick_count % 5 == 0) {
+            for (int i = 0; i < d->gpu_count; i++) {
+                strcpy(d->gpus[i].model, g_cache[i].model);
+                d->gpus[i].active = 1;
+                d->gpus[i].freq_mhz = 0; d->gpus[i].temp_c = -1;
+                d->gpus[i].util_pct = -1; d->gpus[i].vram_used_mib = -1; d->gpus[i].vram_total_mib = -1;
+            }
+
+            if (has_nvidia_smi) {
+                FILE *fp = popen(NVIDIA_SMI_PATH
+                    " --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu"
+                    " --format=csv,noheader,nounits 2>/dev/null", "r");
+                if (fp) {
+                    char sbuf[256];
+                    int nv_line = 0;
+                    while (fgets(sbuf, sizeof(sbuf), fp)) {
+                        float util; int mem_used, mem_total, gtemp;
+                        if (sscanf(sbuf, " %f , %d , %d , %d", &util, &mem_used, &mem_total, &gtemp) == 4) {
+                            for (int i = 0; i < d->gpu_count; i++) {
+                                if (!g_cache[i].is_nvidia) continue;
+                                int nth = 0;
+                                for (int j = 0; j < i; j++)
+                                    if (g_cache[j].is_nvidia) nth++;
+                                if (nth == nv_line) {
+                                    d->gpus[i].util_pct = util;
+                                    d->gpus[i].vram_used_mib = mem_used;
+                                    d->gpus[i].vram_total_mib = mem_total;
+                                    d->gpus[i].temp_c = gtemp;
+                                    break;
+                                }
                             }
+                            nv_line++;
                         }
-                        pclose(fp);
+                    }
+                    pclose(fp);
+                }
+            }
+
+            for (int i = 0; i < d->gpu_count; i++) {
+                if (g_cache[i].is_nvidia) {
+                    if (d->gpus[i].util_pct < 0) {
+                        char sysnode[64]; int gtemp; size_t sz = sizeof(gtemp);
+                        int nv_idx = 0;
+                        for (int j = 0; j < i; j++)
+                            if (g_cache[j].is_nvidia) nv_idx++;
+                        snprintf(sysnode, sizeof(sysnode), "dev.nvidia.%d.temperature", nv_idx);
+                        if (sysctlbyname(sysnode, &gtemp, &sz, NULL, 0) == 0) d->gpus[i].temp_c = gtemp;
+                    }
+                } else {
+                    int gfreq; size_t sz = sizeof(gfreq);
+                    int drm_idx = 0;
+                    for (int j = 0; j < i; j++)
+                        if (!g_cache[j].is_nvidia) drm_idx++;
+                    char node[64];
+                    snprintf(node, sizeof(node), "dev.drm.%d.gt_cur_freq_mhz", drm_idx);
+                    if (sysctlbyname(node, &gfreq, &sz, NULL, 0) == 0) d->gpus[i].freq_mhz = gfreq;
+                    else {
+                        snprintf(node, sizeof(node), "dev.drmn.%d.gt_cur_freq_mhz", drm_idx);
+                        if (sysctlbyname(node, &gfreq, &sz, NULL, 0) == 0) d->gpus[i].freq_mhz = gfreq;
                     }
                 }
-                /* Fallback to sysctl if nvidia-smi unavailable or failed */
-                if (!got_smi) {
-                    char sysnode[64];
-                    snprintf(sysnode, sizeof(sysnode), "dev.nvidia.%d.temperature", g_cache[i].unit);
-                    int gtemp; size_t sz = sizeof(gtemp);
-                    if (sysctlbyname(sysnode, &gtemp, &sz, NULL, 0) == 0) d->gpus[i].temp_c = gtemp;
-                }
-            } else {
-                int gfreq; size_t sz = sizeof(gfreq);
-                if (sysctlbyname("dev.drm.0.gt_cur_freq_mhz", &gfreq, &sz, NULL, 0) == 0) d->gpus[i].freq_mhz = gfreq;
-                else if (sysctlbyname("dev.drmn.0.gt_cur_freq_mhz", &gfreq, &sz, NULL, 0) == 0) d->gpus[i].freq_mhz = gfreq;
             }
         }
     }
@@ -521,7 +594,7 @@ void draw_box(int y, int x, int h, int w, const char *title) {
 }
 
 void print_val(int y, int x, int w, const char *lbl, const char *val) {
-    if (w < 5) return;
+    if (w < 5 || y < 1) return;
     move_cursor(y, x); set_color(37); 
     int lbl_len = strlen(lbl); if (lbl_len > w - 6) lbl_len = w - 6;
     printf("%.*s", lbl_len, lbl); reset_color();
@@ -536,7 +609,8 @@ void print_val(int y, int x, int w, const char *lbl, const char *val) {
 }
 
 void print_bar(int y, int x, int w, double pct, const char *lbl) {
-    if (w < 15) return;
+    if (w < 15 || y < 1) return;
+    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     move_cursor(y, x); set_color(37); 
     int lbl_len = strlen(lbl); if (lbl_len > w / 2) lbl_len = w / 2;
     printf("%.*s ", lbl_len, lbl); reset_color();
@@ -554,43 +628,73 @@ void print_bar(int y, int x, int w, double pct, const char *lbl) {
 void render(struct mon_data *d) {
     int col_w = term_width / 3 - 1; if (col_w < 30) col_w = 30;
     int h = term_height - 6;
+    int box_top = 5;
+    int box_bot = box_top + h - 1;
+
     move_cursor(2, (term_width - 24) / 2); printf("║ FreeBSD System Monitor ║");
     move_cursor(3, (term_width - 24) / 2); printf("╚════════════════════════╝");
 
-    draw_box(5, 1, h, col_w, "SYSTEM");
-    char buf[128];
-    print_val(7, 3, col_w - 4, "Time:", d->time_str);
-    print_val(8, 3, col_w - 4, "Date:", d->date_str);
-    print_val(9, 3, col_w - 4, "Host:", d->host);
-    print_val(10, 3, col_w - 4, "Uptime:", d->uptime_str);
-    snprintf(buf, sizeof(buf), "%.2f %.2f %.2f", d->load[0], d->load[1], d->load[2]);
-    print_val(11, 3, col_w - 4, "Load:", buf);
-    move_cursor(13, 3); set_color(36); printf("CPU"); reset_color();
-    move_cursor(14, 3); printf("%.*s", col_w - 6, d->cpu_model);
-    snprintf(buf, sizeof(buf), "%.2f GHz", d->cpu_freq_ghz); print_val(15, 3, col_w - 4, "Frequency:", buf);
-    snprintf(buf, sizeof(buf), "%d", d->cpu_cores); print_val(16, 3, col_w - 4, "Cores:", buf);
-    print_bar(17, 3, col_w - 4, d->cpu_usage, "Usage");
-    move_cursor(19, 3); set_color(36); printf("MEMORY"); reset_color();
-    snprintf(buf, sizeof(buf), "%.2f GB", d->mem_total / (1024.0*1024.0*1024.0)); print_val(20, 3, col_w - 4, "Total:", buf);
-    snprintf(buf, sizeof(buf), "%.2f GB", d->mem_used / (1024.0*1024.0*1024.0)); print_val(21, 3, col_w - 4, "Used:", buf);
-    print_bar(22, 3, col_w - 4, d->mem_usage, "Usage");
-    move_cursor(24, 3); set_color(36); printf("SOFTWARE & BUS"); reset_color();
-    snprintf(buf, sizeof(buf), "%d devices", d->pci_device_count); print_val(25, 3, col_w - 4, "PCI Devices:", buf);
-    snprintf(buf, sizeof(buf), "%d installed", d->pkg_count); print_val(26, 3, col_w - 4, "pkg Packages:", buf);
-    snprintf(buf, sizeof(buf), "%d built", d->ports_count); print_val(27, 3, col_w - 4, "Ports:", buf);
-    snprintf(buf, sizeof(buf), "%d program(s)", d->linux_count); print_val(28, 3, col_w - 4, "Linux Compat:", buf);
+    draw_box(box_top, 1, h, col_w, "SYSTEM");
+    char buf[256];
+    int r = box_top + 2;
 
-    draw_box(5, col_w + 1, h, col_w, "THERMAL & POWER");
-    move_cursor(7, col_w + 3); set_color(36); printf("THERMAL"); reset_color();
-    snprintf(buf, sizeof(buf), "%.1f °C", d->cpu_temp); print_val(8, col_w + 3, col_w - 4, "CPU Temp:", buf);
-    print_val(9, col_w + 3, col_w - 4, "State:", d->thermal_state);
+    print_val(r++, 3, col_w - 4, "Time:", d->time_str);
+    print_val(r++, 3, col_w - 4, "Date:", d->date_str);
+    print_val(r++, 3, col_w - 4, "Host:", d->host);
+    print_val(r++, 3, col_w - 4, "Uptime:", d->uptime_str);
+    snprintf(buf, sizeof(buf), "%.2f %.2f %.2f", d->load[0], d->load[1], d->load[2]);
+    print_val(r++, 3, col_w - 4, "Load:", buf);
+    r++;
+    if (r < box_bot) { move_cursor(r++, 3); set_color(36); printf("CPU"); reset_color(); }
+    if (r < box_bot) { move_cursor(r++, 3); printf("%.*s", col_w - 6, d->cpu_model); }
+    snprintf(buf, sizeof(buf), "%.2f GHz", d->cpu_freq_ghz);
+    if (r < box_bot) print_val(r++, 3, col_w - 4, "Frequency:", buf);
+    snprintf(buf, sizeof(buf), "%d", d->cpu_cores);
+    if (r < box_bot) print_val(r++, 3, col_w - 4, "Cores:", buf);
+    if (r < box_bot) print_bar(r++, 3, col_w - 4, d->cpu_usage, "Usage");
+    r++;
+    if (r < box_bot) { move_cursor(r++, 3); set_color(36); printf("MEMORY"); reset_color(); }
+    snprintf(buf, sizeof(buf), "%.2f GB", d->mem_total / (1024.0*1024.0*1024.0));
+    if (r < box_bot) print_val(r++, 3, col_w - 4, "Total:", buf);
+    snprintf(buf, sizeof(buf), "%.2f GB", d->mem_used / (1024.0*1024.0*1024.0));
+    if (r < box_bot) print_val(r++, 3, col_w - 4, "Used:", buf);
+    if (r < box_bot) print_bar(r++, 3, col_w - 4, d->mem_usage, "Usage");
+    r++;
+    if (r < box_bot) { move_cursor(r++, 3); set_color(36); printf("SOFTWARE & BUS"); reset_color(); }
+    snprintf(buf, sizeof(buf), "%d devices", d->pci_device_count);
+    if (r < box_bot) print_val(r++, 3, col_w - 4, "PCI Devices:", buf);
+    snprintf(buf, sizeof(buf), "%d installed", d->pkg_count);
+    if (r < box_bot) print_val(r++, 3, col_w - 4, "pkg Packages:", buf);
+    snprintf(buf, sizeof(buf), "%d built", d->ports_count);
+    if (r < box_bot) print_val(r++, 3, col_w - 4, "Ports:", buf);
+    snprintf(buf, sizeof(buf), "%d program(s)", d->linux_count);
+    if (r < box_bot) print_val(r++, 3, col_w - 4, "Linux Compat:", buf);
+    if (d->user_bin_count > 0 && r < box_bot) {
+        snprintf(buf, sizeof(buf), "%d program(s)", d->user_bin_count);
+        print_val(r++, 3, col_w - 4, "User Binaries:", buf);
+    }
+
+    int c2x = col_w + 1;
+    int c2w = col_w;
+    int c2inner = c2w - 4;
+    draw_box(box_top, c2x, h, c2w, "THERMAL & POWER");
+    r = box_top + 2;
+    if (r < box_bot) { move_cursor(r++, c2x + 2); set_color(36); printf("THERMAL"); reset_color(); }
+    snprintf(buf, sizeof(buf), "%.1f °C", d->cpu_temp);
+    if (r < box_bot) print_val(r++, c2x + 2, c2inner, "CPU Temp:", buf);
+    if (r < box_bot) print_val(r++, c2x + 2, c2inner, "State:", d->thermal_state);
     snprintf(buf, sizeof(buf), "%.0f MHz (%c)", d->live_freq_mhz, d->freq_trend > 0 ? '+' : (d->freq_trend < 0 ? '-' : '='));
-    print_val(10, col_w + 3, col_w - 4, "Live Freq:", buf);
-    move_cursor(12, col_w + 3); set_color(36); printf("GPU HARDWARE"); reset_color();
-    for (int i = 0; i < d->gpu_count; i++) {
-        int r = 13 + i * 4; if (r > h + 3) break;
-        move_cursor(r, col_w + 3); printf("%.*s", col_w - 6, d->gpus[i].model);
-        /* Build status line: combine available metrics */
+    if (r < box_bot) print_val(r++, c2x + 2, c2inner, "Live Freq:", buf);
+    r++;
+
+    if (r < box_bot) { move_cursor(r++, c2x + 2); set_color(36); printf("GPU HARDWARE"); reset_color(); }
+    if (d->gpu_count == 0) {
+        if (r < box_bot) print_val(r++, c2x + 2, c2inner, "  Status:", "No GPU detected");
+    }
+    for (int i = 0; i < d->gpu_count && r < box_bot; i++) {
+        move_cursor(r++, c2x + 2);
+        printf("%.*s", c2inner - 2, d->gpus[i].model);
+
         if (d->gpus[i].util_pct >= 0) {
             snprintf(buf, sizeof(buf), "%.0f%%", d->gpus[i].util_pct);
             if (d->gpus[i].temp_c >= 0) {
@@ -606,65 +710,81 @@ void render(struct mon_data *d) {
         } else {
             strcpy(buf, "Active");
         }
-        print_val(r + 1, col_w + 3, col_w - 4, "  Status:", buf);
-        /* VRAM line: show when nvidia-smi provided data */
-        if (d->gpus[i].vram_used_mib >= 0 && d->gpus[i].vram_total_mib > 0) {
-            snprintf(buf, sizeof(buf), "%ld / %ld MiB", d->gpus[i].vram_used_mib, d->gpus[i].vram_total_mib);
-            print_val(r + 2, col_w + 3, col_w - 4, "  VRAM:", buf);
-        } else if (d->gpus[i].vram_total_mib == -1 && d->gpus[i].vram_used_mib == -1) {
-            /* No VRAM data at all — skip line silently for Intel iGPU */
-        } else {
-            print_val(r + 2, col_w + 3, col_w - 4, "  VRAM:", "N/A");
+        if (r < box_bot) print_val(r++, c2x + 2, c2inner, "  Status:", buf);
+
+        if (d->gpus[i].util_pct >= 0 && r < box_bot) {
+            print_bar(r++, c2x + 2, c2inner, d->gpus[i].util_pct, "  GPU");
+        }
+
+        if (d->gpus[i].vram_used_mib >= 0 && d->gpus[i].vram_total_mib > 0 && r < box_bot) {
+            double vram_pct = 100.0 * d->gpus[i].vram_used_mib / d->gpus[i].vram_total_mib;
+            snprintf(buf, sizeof(buf), "%ld/%ldM", d->gpus[i].vram_used_mib, d->gpus[i].vram_total_mib);
+            print_bar(r++, c2x + 2, c2inner, vram_pct, buf);
         }
     }
-    move_cursor(18, col_w + 3); set_color(36); printf("POWER & ACPI"); reset_color();
-    print_val(19, col_w + 3, col_w - 4, "powerd:", d->powerd_running ? "Running ✓" : "Stopped ✗");
-    print_val(20, col_w + 3, col_w - 4, "powerdxx:", d->powerdxx_running ? "Running ✓" : "Stopped ✗");
-    print_val(21, col_w + 3, col_w - 4, "Cx Lowest:", d->cx_lowest);
-    move_cursor(22, col_w + 3); printf("Cx Usage: %.*s", col_w - 14, d->cx_usage);
-    move_cursor(24, col_w + 3); set_color(36); printf("BATTERY"); reset_color();
-    print_val(25, col_w + 3, col_w - 4, "Source:", d->bat_source);
-    print_bar(26, col_w + 3, col_w - 4, (double)d->bat_life, "Bat");
-    print_val(27, col_w + 3, col_w - 4, "State:", d->bat_state);
-    move_cursor(29, col_w + 3); set_color(36); printf("FREQ RANGE"); reset_color();
-    char *pp = d->freq_levels; int row = 30;
-    while (*pp && row < h + 4) {
+    r++;
+
+    if (r < box_bot) { move_cursor(r++, c2x + 2); set_color(36); printf("POWER & ACPI"); reset_color(); }
+    if (r < box_bot) print_val(r++, c2x + 2, c2inner, "powerd:", d->powerd_running ? "Running ✓" : "Stopped ✗");
+    if (r < box_bot) print_val(r++, c2x + 2, c2inner, "powerdxx:", d->powerdxx_running ? "Running ✓" : "Stopped ✗");
+    if (r < box_bot) print_val(r++, c2x + 2, c2inner, "Cx Lowest:", d->cx_lowest);
+    if (r < box_bot) { move_cursor(r++, c2x + 2); printf("Cx Usage: %.*s", c2inner - 10, d->cx_usage); }
+    r++;
+    if (r < box_bot) { move_cursor(r++, c2x + 2); set_color(36); printf("BATTERY"); reset_color(); }
+    if (r < box_bot) print_val(r++, c2x + 2, c2inner, "Source:", d->bat_source);
+    if (r < box_bot) print_bar(r++, c2x + 2, c2inner, (double)d->bat_life, "Bat");
+    if (r < box_bot) print_val(r++, c2x + 2, c2inner, "State:", d->bat_state);
+    r++;
+    if (r < box_bot) { move_cursor(r++, c2x + 2); set_color(36); printf("FREQ RANGE"); reset_color(); }
+    char *pp = d->freq_levels;
+    while (*pp && r < box_bot) {
         char level[32]; int n; if (sscanf(pp, "%31s%n", level, &n) != 1) break;
-        move_cursor(row++, col_w + 5); printf("%s MHz", level); pp += n; while (*pp == ' ') pp++;
+        move_cursor(r++, c2x + 4); printf("%s MHz", level); pp += n; while (*pp == ' ') pp++;
     }
 
-    draw_box(5, 2 * col_w + 1, h, term_width - 2 * col_w, "NETWORK & DISKS");
-    int net_row = 7;
-    for(int i=0; i<d->if_count; i++) {
-        move_cursor(net_row++, 2 * col_w + 3); set_color(36); printf("NET: %s (%s)", d->ifaces[i].name, d->ifaces[i].is_wifi ? "WiFi" : "Ethernet"); reset_color();
-        print_val(net_row++, 2 * col_w + 3, term_width - 2 * col_w - 4, "IP:", d->ifaces[i].ip);
-        snprintf(buf, sizeof(buf), "%.2f KB/s", d->ifaces[i].rx_rate_kb); print_val(net_row++, 2 * col_w + 3, term_width - 2 * col_w - 4, "Down:", buf);
-        snprintf(buf, sizeof(buf), "%.2f KB/s", d->ifaces[i].tx_rate_kb); print_val(net_row++, 2 * col_w + 3, term_width - 2 * col_w - 4, "Up:", buf);
-        if (net_row > 18) break; 
+    int c3x = 2 * col_w + 1;
+    int c3w = term_width - 2 * col_w;
+    int c3inner = c3w - 4;
+    draw_box(box_top, c3x, h, c3w, "NETWORK & DISKS");
+    r = box_top + 2;
+
+    for (int i = 0; i < d->if_count && r < box_bot; i++) {
+        move_cursor(r++, c3x + 2); set_color(36);
+        printf("NET: %s (%s)", d->ifaces[i].name, d->ifaces[i].is_wifi ? "WiFi" : "Ethernet");
+        reset_color();
+        if (r < box_bot) print_val(r++, c3x + 2, c3inner, "IP:", d->ifaces[i].ip);
+        snprintf(buf, sizeof(buf), "%.2f KB/s", d->ifaces[i].rx_rate_kb);
+        if (r < box_bot) print_val(r++, c3x + 2, c3inner, "Down:", buf);
+        snprintf(buf, sizeof(buf), "%.2f KB/s", d->ifaces[i].tx_rate_kb);
+        if (r < box_bot) print_val(r++, c3x + 2, c3inner, "Up:", buf);
+        snprintf(buf, sizeof(buf), "%.2f GB", d->ifaces[i].total_rx_gb);
+        if (r < box_bot) print_val(r++, c3x + 2, c3inner, "Total Rx:", buf);
+        snprintf(buf, sizeof(buf), "%.2f GB", d->ifaces[i].total_tx_gb);
+        if (r < box_bot) print_val(r++, c3x + 2, c3inner, "Total Tx:", buf);
+        r++;
     }
-    move_cursor(21, 2 * col_w + 3); set_color(36); printf("SWAP"); reset_color();
-    snprintf(buf, sizeof(buf), "%.2f GB", d->swap_total / (1024.0*1024.0*1024.0)); print_val(22, 2 * col_w + 3, term_width - 2 * col_w - 4, "Total:", buf);
-    print_bar(23, 2 * col_w + 3, term_width - 2 * col_w - 4, d->swap_usage, "Usage");
-    move_cursor(25, 2 * col_w + 3); set_color(36); printf("DISKS"); reset_color();
-    for (int i = 0; i < d->disk_count; i++) {
-        if (26 + i * 2 > h + 3) break;
-        move_cursor(26 + i * 2, 2 * col_w + 3); printf("%.*s", (term_width - 2 * col_w - 4), d->disks[i].mount);
-        snprintf(buf, sizeof(buf), "%.1f/%.1fG", d->disks[i].used_bytes / (1024.0*1024.0*1024.0), d->disks[i].total_bytes / (1024.0*1024.0*1024.0));
-        print_bar(27 + i * 2, 2 * col_w + 3, term_width - 2 * col_w - 4, d->disks[i].usage, buf);
+
+    if (r < box_bot) { move_cursor(r++, c3x + 2); set_color(36); printf("SWAP"); reset_color(); }
+    snprintf(buf, sizeof(buf), "%.2f GB", d->swap_total / (1024.0*1024.0*1024.0));
+    if (r < box_bot) print_val(r++, c3x + 2, c3inner, "Total:", buf);
+    if (r < box_bot) print_bar(r++, c3x + 2, c3inner, d->swap_usage, "Usage");
+    r++;
+
+    if (r < box_bot) { move_cursor(r++, c3x + 2); set_color(36); printf("DISKS"); reset_color(); }
+    for (int i = 0; i < d->disk_count && r < box_bot; i++) {
+        move_cursor(r++, c3x + 2); printf("%.*s", c3inner, d->disks[i].mount);
+        if (r < box_bot) {
+            snprintf(buf, sizeof(buf), "%.1f/%.1fG", d->disks[i].used_bytes / (1024.0*1024.0*1024.0), d->disks[i].total_bytes / (1024.0*1024.0*1024.0));
+            print_bar(r++, c3x + 2, c3inner, d->disks[i].usage, buf);
+        }
     }
 }
 
 int main() {
-    /* Resolve the real user's home directory from the system user database
-     * before sanitizing the environment.  When running under sudo, SUDO_UID
-     * identifies the invoking user; otherwise the process's real UID is used.
-     * Using getpwuid() avoids trusting attacker-controlled environment
-     * variables (HOME/USER/SUDO_USER) in a setuid-root binary. */
     char resolved_home[MAXPATHLEN] = "";
+    char resolved_home_dir[MAXPATHLEN] = "";
     {
         uid_t target_uid = getuid();
-        /* Only trust SUDO_UID when running as root; an unprivileged caller
-         * must not be able to influence which home directory is monitored. */
         if (target_uid == 0) {
             const char *sudo_uid_str = getenv("SUDO_UID");
             if (sudo_uid_str != NULL) {
@@ -681,20 +801,13 @@ int main() {
         }
         struct passwd *pw = getpwuid(target_uid);
         if (pw != NULL && pw->pw_dir != NULL) {
-            /* Disk matching compares against f_mntonname (the mountpoint), not
-             * the home directory path itself.  Use statfs() to find the
-             * mountpoint that contains the home directory. */
+            strncpy(resolved_home_dir, pw->pw_dir, sizeof(resolved_home_dir) - 1);
             struct statfs home_fs;
             if (statfs(pw->pw_dir, &home_fs) == 0) {
-                /* Avoid setting resolved_home to "/" when the home directory
-                 * lives on the root filesystem, since "/" is already a
-                 * monitored target and would otherwise be added twice. */
                 if (!(home_fs.f_mntonname[0] == '/' && home_fs.f_mntonname[1] == '\0')) {
                     strncpy(resolved_home, home_fs.f_mntonname, sizeof(resolved_home) - 1);
                 }
             } else {
-                /* Fallback: use the home directory path itself, but likewise
-                 * skip it if it is exactly "/". */
                 if (!(pw->pw_dir[0] == '/' && pw->pw_dir[1] == '\0')) {
                     strncpy(resolved_home, pw->pw_dir, sizeof(resolved_home) - 1);
                 }
@@ -702,15 +815,10 @@ int main() {
         }
     }
 
-    /* Sanitize environment for setuid safety: use an allowlist approach so no
-     * dangerous variable (LD_*, IFS, ENV, BASH_ENV, locale, etc.) is missed.
-     * Only TERM is restored; home-directory detection uses resolved_home which
-     * was derived from the user database, not the environment. */
     const char *term_env = getenv("TERM");
-    /* Bound TERM to a reasonable length to prevent DoS via oversized values. */
     char *term = (term_env != NULL) ? strndup(term_env, 64) : NULL;
     if (clearenv() != 0 ||
-        setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/sbin", 1) != 0 ||
+        setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/sbin:/usr/local/bin", 1) != 0 ||
         (term != NULL && setenv("TERM", term, 1) != 0)) {
         fprintf(stderr, "Failed to sanitize environment: %s\n", strerror(errno));
         free(term);
@@ -719,6 +827,7 @@ int main() {
     free(term);
     struct mon_data d = {0};
     strncpy(d.home_path, resolved_home, sizeof(d.home_path) - 1);
+    strncpy(d.home_dir, resolved_home_dir, sizeof(d.home_dir) - 1);
     enable_raw_mode();
     signal(SIGWINCH, handle_sigwinch);
     get_terminal_size();
