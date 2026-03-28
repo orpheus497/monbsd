@@ -384,8 +384,7 @@ void gather_data(struct mon_data *d) {
             }
             /* One-time check: does nvidia-smi exist and is it executable? */
             if (has_nvidia_smi < 0) {
-                struct stat smi_st;
-                has_nvidia_smi = (stat(NVIDIA_SMI_PATH, &smi_st) == 0 && (smi_st.st_mode & S_IXUSR)) ? 1 : 0;
+                has_nvidia_smi = (access(NVIDIA_SMI_PATH, X_OK) == 0) ? 1 : 0;
             }
             g_init = 1;
         } else {
@@ -407,7 +406,7 @@ void gather_data(struct mon_data *d) {
                         char sbuf[128];
                         if (fgets(sbuf, sizeof(sbuf), fp)) {
                             float util; int mem_used, mem_total, gtemp;
-                            if (sscanf(sbuf, "%f, %d, %d, %d", &util, &mem_used, &mem_total, &gtemp) == 4) {
+                            if (sscanf(sbuf, " %f , %d , %d , %d", &util, &mem_used, &mem_total, &gtemp) == 4) {
                                 d->gpus[i].util_pct = util;
                                 d->gpus[i].vram_used_mib = mem_used;
                                 d->gpus[i].vram_total_mib = mem_total;
@@ -595,8 +594,8 @@ void render(struct mon_data *d) {
         if (d->gpus[i].util_pct >= 0) {
             snprintf(buf, sizeof(buf), "%.0f%%", d->gpus[i].util_pct);
             if (d->gpus[i].temp_c >= 0) {
-                char tbuf[32]; snprintf(tbuf, sizeof(tbuf), " | %.0f C", d->gpus[i].temp_c);
-                strncat(buf, tbuf, sizeof(buf) - strlen(buf) - 1);
+                size_t len = strlen(buf);
+                snprintf(buf + len, sizeof(buf) - len, " | %.0f C", d->gpus[i].temp_c);
             }
         } else if (d->gpus[i].temp_c >= 0 && d->gpus[i].freq_mhz > 0) {
             snprintf(buf, sizeof(buf), "%.0f MHz | %.0f C", d->gpus[i].freq_mhz, d->gpus[i].temp_c);
