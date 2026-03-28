@@ -409,12 +409,16 @@ void gather_data(struct mon_data *d) {
         struct ifmibdata ifmd; size = sizeof(ifmd);
         if (sysctl(mib, 6, &ifmd, &size, NULL, 0) == 0) {
             if (strcmp(ifmd.ifmd_name, "lo0") == 0) continue;
+            if (ifmd.ifmd_data.ifi_link_state != LINK_STATE_UP) continue;
+            char ip_buf[INET_ADDRSTRLEN];
+            get_ip_address(ifmd.ifmd_name, ip_buf);
+            if (strcmp(ip_buf, "Unknown") == 0) continue;
             strcpy(d->ifaces[d->if_count].name, ifmd.ifmd_name);
+            strcpy(d->ifaces[d->if_count].ip, ip_buf);
             d->ifaces[d->if_count].total_rx_gb = ifmd.ifmd_data.ifi_ibytes / (1024.0*1024.0*1024.0);
             d->ifaces[d->if_count].total_tx_gb = ifmd.ifmd_data.ifi_obytes / (1024.0*1024.0*1024.0);
             d->ifaces[d->if_count].is_wifi = (strncmp(ifmd.ifmd_name, "wlan", 4) == 0);
-            d->ifaces[d->if_count].active = (ifmd.ifmd_data.ifi_link_state == LINK_STATE_UP);
-            get_ip_address(ifmd.ifmd_name, d->ifaces[d->if_count].ip);
+            d->ifaces[d->if_count].active = 1;
             
             int oidx = (hist_idx + 1) % HISTORY_SIZE;
             if (history[oidx].valid) {
