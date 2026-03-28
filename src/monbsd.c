@@ -32,11 +32,15 @@
 #define MAX_DISKS 8
 #define MAX_NET_IF 4
 #define MAX_GPUS 2
+#define NVIDIA_SMI_PATH "/usr/local/bin/nvidia-smi"
 
 struct gpu_data {
     char model[128];
     double freq_mhz;
     double temp_c;
+    double util_pct;      /* GPU core utilization % (-1 = unavailable) */
+    long vram_used_mib;   /* VRAM used in MiB (-1 = unavailable) */
+    long vram_total_mib;  /* VRAM total in MiB (-1 = unavailable) */
     int active;
 };
 
@@ -354,6 +358,7 @@ void gather_data(struct mon_data *d) {
             int is_nvidia;
         } g_cache[MAX_GPUS];
         static int g_init = 0;
+        static int has_nvidia_smi = -1; /* -1 = unchecked, 0 = absent, 1 = present */
         if (!g_init) {
             FILE *fp = popen("/usr/sbin/pciconf -lv 2>/dev/null | /usr/bin/grep -A 2 'class=0x03'", "r");
             if (fp) {
@@ -377,6 +382,10 @@ void gather_data(struct mon_data *d) {
                 pclose(fp);
                 d->gpu_count = g_count;
             }
+            /* One-time check: does nvidia-smi exist and is it executable? */
+            if (has_nvidia_smi < 0) {
+                has_nvidia_smi = (access(NVIDIA_SMI_PATH, X_OK) == 0) ? 1 : 0;
+            }
             g_init = 1;
         } else {
             // Count from cache
@@ -386,11 +395,35 @@ void gather_data(struct mon_data *d) {
             strcpy(d->gpus[i].model, g_cache[i].model);
             d->gpus[i].active = 1;
             d->gpus[i].freq_mhz = 0; d->gpus[i].temp_c = -1;
+            d->gpus[i].util_pct = -1; d->gpus[i].vram_used_mib = -1; d->gpus[i].vram_total_mib = -1;
             if (g_cache[i].is_nvidia) {
-                char sysnode[64];
-                snprintf(sysnode, sizeof(sysnode), "dev.nvidia.%d.temperature", g_cache[i].unit);
-                int gtemp; size_t sz = sizeof(gtemp);
-                if (sysctlbyname(sysnode, &gtemp, &sz, NULL, 0) == 0) d->gpus[i].temp_c = gtemp;
+                int got_smi = 0;
+                if (has_nvidia_smi) {
+                    FILE *fp = popen(NVIDIA_SMI_PATH
+                        " --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu"
+                        " --format=csv,noheader,nounits 2>/dev/null", "r");
+                    if (fp) {
+                        char sbuf[128];
+                        if (fgets(sbuf, sizeof(sbuf), fp)) {
+                            float util; int mem_used, mem_total, gtemp;
+                            if (sscanf(sbuf, " %f , %d , %d , %d", &util, &mem_used, &mem_total, &gtemp) == 4) {
+                                d->gpus[i].util_pct = util;
+                                d->gpus[i].vram_used_mib = mem_used;
+                                d->gpus[i].vram_total_mib = mem_total;
+                                d->gpus[i].temp_c = gtemp;
+                                got_smi = 1;
+                            }
+                        }
+                        pclose(fp);
+                    }
+                }
+                /* Fallback to sysctl if nvidia-smi unavailable or failed */
+                if (!got_smi) {
+                    char sysnode[64];
+                    snprintf(sysnode, sizeof(sysnode), "dev.nvidia.%d.temperature", g_cache[i].unit);
+                    int gtemp; size_t sz = sizeof(gtemp);
+                    if (sysctlbyname(sysnode, &gtemp, &sz, NULL, 0) == 0) d->gpus[i].temp_c = gtemp;
+                }
             } else {
                 int gfreq; size_t sz = sizeof(gfreq);
                 if (sysctlbyname("dev.drm.0.gt_cur_freq_mhz", &gfreq, &sz, NULL, 0) == 0) d->gpus[i].freq_mhz = gfreq;
@@ -409,12 +442,16 @@ void gather_data(struct mon_data *d) {
         struct ifmibdata ifmd; size = sizeof(ifmd);
         if (sysctl(mib, 6, &ifmd, &size, NULL, 0) == 0) {
             if (strcmp(ifmd.ifmd_name, "lo0") == 0) continue;
+            if (ifmd.ifmd_data.ifi_link_state != LINK_STATE_UP) continue;
+            char ip_buf[INET_ADDRSTRLEN];
+            get_ip_address(ifmd.ifmd_name, ip_buf);
+            if (strcmp(ip_buf, "Unknown") == 0) continue;
             strcpy(d->ifaces[d->if_count].name, ifmd.ifmd_name);
+            strcpy(d->ifaces[d->if_count].ip, ip_buf);
             d->ifaces[d->if_count].total_rx_gb = ifmd.ifmd_data.ifi_ibytes / (1024.0*1024.0*1024.0);
             d->ifaces[d->if_count].total_tx_gb = ifmd.ifmd_data.ifi_obytes / (1024.0*1024.0*1024.0);
             d->ifaces[d->if_count].is_wifi = (strncmp(ifmd.ifmd_name, "wlan", 4) == 0);
-            d->ifaces[d->if_count].active = (ifmd.ifmd_data.ifi_link_state == LINK_STATE_UP);
-            get_ip_address(ifmd.ifmd_name, d->ifaces[d->if_count].ip);
+            d->ifaces[d->if_count].active = 1;
             
             int oidx = (hist_idx + 1) % HISTORY_SIZE;
             if (history[oidx].valid) {
@@ -551,13 +588,34 @@ void render(struct mon_data *d) {
     print_val(10, col_w + 3, col_w - 4, "Live Freq:", buf);
     move_cursor(12, col_w + 3); set_color(36); printf("GPU HARDWARE"); reset_color();
     for (int i = 0; i < d->gpu_count; i++) {
-        int r = 13 + i * 2; if (r > h + 3) break;
+        int r = 13 + i * 4; if (r > h + 3) break;
         move_cursor(r, col_w + 3); printf("%.*s", col_w - 6, d->gpus[i].model);
-        if (d->gpus[i].temp_c >= 0 && d->gpus[i].freq_mhz > 0) snprintf(buf, sizeof(buf), "%.0f MHz | %.0f C", d->gpus[i].freq_mhz, d->gpus[i].temp_c);
-        else if (d->gpus[i].temp_c >= 0) snprintf(buf, sizeof(buf), "%.0f C", d->gpus[i].temp_c);
-        else if (d->gpus[i].freq_mhz > 0) snprintf(buf, sizeof(buf), "%.0f MHz", d->gpus[i].freq_mhz);
-        else strcpy(buf, "Active");
+        /* Build status line: combine available metrics */
+        if (d->gpus[i].util_pct >= 0) {
+            snprintf(buf, sizeof(buf), "%.0f%%", d->gpus[i].util_pct);
+            if (d->gpus[i].temp_c >= 0) {
+                size_t len = strlen(buf);
+                snprintf(buf + len, sizeof(buf) - len, " | %.0f C", d->gpus[i].temp_c);
+            }
+        } else if (d->gpus[i].temp_c >= 0 && d->gpus[i].freq_mhz > 0) {
+            snprintf(buf, sizeof(buf), "%.0f MHz | %.0f C", d->gpus[i].freq_mhz, d->gpus[i].temp_c);
+        } else if (d->gpus[i].temp_c >= 0) {
+            snprintf(buf, sizeof(buf), "%.0f C", d->gpus[i].temp_c);
+        } else if (d->gpus[i].freq_mhz > 0) {
+            snprintf(buf, sizeof(buf), "%.0f MHz", d->gpus[i].freq_mhz);
+        } else {
+            strcpy(buf, "Active");
+        }
         print_val(r + 1, col_w + 3, col_w - 4, "  Status:", buf);
+        /* VRAM line: show when nvidia-smi provided data */
+        if (d->gpus[i].vram_used_mib >= 0 && d->gpus[i].vram_total_mib > 0) {
+            snprintf(buf, sizeof(buf), "%ld / %ld MiB", d->gpus[i].vram_used_mib, d->gpus[i].vram_total_mib);
+            print_val(r + 2, col_w + 3, col_w - 4, "  VRAM:", buf);
+        } else if (d->gpus[i].vram_total_mib == -1 && d->gpus[i].vram_used_mib == -1) {
+            /* No VRAM data at all — skip line silently for Intel iGPU */
+        } else {
+            print_val(r + 2, col_w + 3, col_w - 4, "  VRAM:", "N/A");
+        }
     }
     move_cursor(18, col_w + 3); set_color(36); printf("POWER & ACPI"); reset_color();
     print_val(19, col_w + 3, col_w - 4, "powerd:", d->powerd_running ? "Running ✓" : "Stopped ✗");
