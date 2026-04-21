@@ -624,15 +624,7 @@ void print_bar(int y, int x, int w, double pct, const char *lbl) {
     printf("] %5.1f%%", pct);
 }
 
-void render(struct mon_data *d) {
-    int col_w = term_width / 3 - 1; if (col_w < 30) col_w = 30;
-    int h = term_height - 6;
-    int box_top = 5;
-    int box_bot = box_top + h - 1;
-
-    move_cursor(2, (term_width - 24) / 2); printf("║ FreeBSD System Monitor ║");
-    move_cursor(3, (term_width - 24) / 2); printf("╚════════════════════════╝");
-
+static void render_system_box(struct mon_data *d, int box_top, int box_bot, int h, int col_w) {
     draw_box(box_top, 1, h, col_w, "SYSTEM");
     char buf[256];
     int r = box_top + 2;
@@ -672,12 +664,15 @@ void render(struct mon_data *d) {
         snprintf(buf, sizeof(buf), "%d program(s)", d->user_bin_count);
         print_val(r++, 3, col_w - 4, "User Binaries:", buf);
     }
+}
 
+static void render_thermal_power_box(struct mon_data *d, int box_top, int box_bot, int h, int col_w) {
     int c2x = col_w + 1;
     int c2w = col_w;
     int c2inner = c2w - 4;
     draw_box(box_top, c2x, h, c2w, "THERMAL & POWER");
-    r = box_top + 2;
+    char buf[256];
+    int r = box_top + 2;
     if (r < box_bot) { move_cursor(r++, c2x + 2); set_color(36); printf("THERMAL"); reset_color(); }
     snprintf(buf, sizeof(buf), "%.1f °C", d->cpu_temp);
     if (r < box_bot) print_val(r++, c2x + 2, c2inner, "CPU Temp:", buf);
@@ -740,12 +735,15 @@ void render(struct mon_data *d) {
         char level[32]; int n; if (sscanf(pp, "%31s%n", level, &n) != 1) break;
         move_cursor(r++, c2x + 4); printf("%s MHz", level); pp += n; while (*pp == ' ') pp++;
     }
+}
 
+static void render_network_disks_box(struct mon_data *d, int box_top, int box_bot, int h, int col_w) {
     int c3x = 2 * col_w + 1;
     int c3w = term_width - 2 * col_w;
     int c3inner = c3w - 4;
     draw_box(box_top, c3x, h, c3w, "NETWORK & DISKS");
-    r = box_top + 2;
+    char buf[256];
+    int r = box_top + 2;
 
     for (int i = 0; i < d->if_count && r < box_bot; i++) {
         move_cursor(r++, c3x + 2); set_color(36);
@@ -777,6 +775,20 @@ void render(struct mon_data *d) {
             print_bar(r++, c3x + 2, c3inner, d->disks[i].usage, buf);
         }
     }
+}
+
+void render(struct mon_data *d) {
+    int col_w = term_width / 3 - 1; if (col_w < 30) col_w = 30;
+    int h = term_height - 6;
+    int box_top = 5;
+    int box_bot = box_top + h - 1;
+
+    move_cursor(2, (term_width - 24) / 2); printf("║ FreeBSD System Monitor ║");
+    move_cursor(3, (term_width - 24) / 2); printf("╚════════════════════════╝");
+
+    render_system_box(d, box_top, box_bot, h, col_w);
+    render_thermal_power_box(d, box_top, box_bot, h, col_w);
+    render_network_disks_box(d, box_top, box_bot, h, col_w);
 }
 
 int main() {
