@@ -103,6 +103,9 @@ struct mon_data {
     int disk_count;
     char home_path[MAXPATHLEN];
     char home_dir[MAXPATHLEN];
+
+    int user_bin_ticks;
+    int cached_user_bin_count;
 };
 
 struct iface_history {
@@ -333,18 +336,22 @@ void gather_data(struct mon_data *d) {
         DIR *dir = opendir("/compat/linux/usr/bin");
         if (dir) { struct dirent *e; while ((e = readdir(dir))) if (e->d_name[0] != '.') d->linux_count++; closedir(dir); }
         d->pci_device_count = direct_pci_count();
+    }
 
-        d->user_bin_count = 0;
+    if (d->user_bin_ticks-- <= 0) {
+        d->user_bin_ticks = 600;
+        d->cached_user_bin_count = 0;
         if (d->home_dir[0]) {
             char probe[MAXPATHLEN];
             snprintf(probe, sizeof(probe), "%s/.local/bin", d->home_dir);
-            d->user_bin_count += count_dir_executables(probe);
+            d->cached_user_bin_count += count_dir_executables(probe);
             snprintf(probe, sizeof(probe), "%s/bin", d->home_dir);
-            d->user_bin_count += count_dir_executables(probe);
+            d->cached_user_bin_count += count_dir_executables(probe);
             snprintf(probe, sizeof(probe), "%s/local/bin", d->home_dir);
-            d->user_bin_count += count_dir_executables(probe);
+            d->cached_user_bin_count += count_dir_executables(probe);
         }
     }
+    d->user_bin_count = d->cached_user_bin_count;
 
     d->cpu_temp = direct_cpu_temp();
     
