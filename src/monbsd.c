@@ -158,14 +158,14 @@ void enable_raw_mode() {
     printf("\033[?25l");
 }
 
-void get_ip_address(const char *ifname, char *ip_buf) {
+void get_ip_address(const char *ifname, char *ip_buf, size_t buf_size) {
     struct ifaddrs *ifaddr, *ifa;
-    strcpy(ip_buf, "Unknown");
+    strlcpy(ip_buf, "Unknown", buf_size);
     if (getifaddrs(&ifaddr) == -1) return;
     for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == NULL) continue;
         if (ifa->ifa_addr->sa_family == AF_INET && strcmp(ifa->ifa_name, ifname) == 0) {
-            inet_ntop(AF_INET, &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr, ip_buf, INET_ADDRSTRLEN);
+            inet_ntop(AF_INET, &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr, ip_buf, buf_size);
             break;
         }
     }
@@ -296,7 +296,7 @@ void gather_data(struct mon_data *d) {
             size = sizeof(cpu_brand); sysctlbyname("hw.model", cpu_brand, &size, NULL, 0);
         }
     }
-    strcpy(d->cpu_model, cpu_brand);
+    strlcpy(d->cpu_model, cpu_brand, sizeof(d->cpu_model));
 
     int freq; size = sizeof(freq);
     if (sysctlbyname("dev.cpu.0.freq", &freq, &size, NULL, 0) == 0) {
@@ -349,18 +349,18 @@ void gather_data(struct mon_data *d) {
     d->cpu_temp = direct_cpu_temp();
     
     int itmp; size = sizeof(itmp);
-    if (sysctlbyname("hw.acpi.thermal.tz0.passive_cooling", &itmp, &size, NULL, 0) == 0) strcpy(d->thermal_state, itmp > 0 ? "Passive" : "Active");
-    else strcpy(d->thermal_state, "Normal");
+    if (sysctlbyname("hw.acpi.thermal.tz0.passive_cooling", &itmp, &size, NULL, 0) == 0) strlcpy(d->thermal_state, itmp > 0 ? "Passive" : "Active", sizeof(d->thermal_state));
+    else strlcpy(d->thermal_state, "Normal", sizeof(d->thermal_state));
 
     if (sysctlbyname("dev.acpi_ibm.0.fan_speed", &itmp, &size, NULL, 0) != 0)
         if (sysctlbyname("dev.aibs.0.fan0.speed", &itmp, &size, NULL, 0) != 0) itmp = -1;
     if (itmp >= 0) snprintf(d->fan_status, sizeof(d->fan_status), "%d RPM", itmp);
-    else strcpy(d->fan_status, "No sensor detected");
+    else strlcpy(d->fan_status, "No sensor detected", sizeof(d->fan_status));
 
     size = sizeof(d->cx_lowest);
-    if (sysctlbyname("hw.acpi.cpu.cx_lowest", d->cx_lowest, &size, NULL, 0) != 0) strcpy(d->cx_lowest, "N/A");
+    if (sysctlbyname("hw.acpi.cpu.cx_lowest", d->cx_lowest, &size, NULL, 0) != 0) strlcpy(d->cx_lowest, "N/A", sizeof(d->cx_lowest));
     size = sizeof(d->cx_usage);
-    if (sysctlbyname("dev.cpu.0.cx_usage", d->cx_usage, &size, NULL, 0) != 0) strcpy(d->cx_usage, "N/A");
+    if (sysctlbyname("dev.cpu.0.cx_usage", d->cx_usage, &size, NULL, 0) != 0) strlcpy(d->cx_usage, "N/A", sizeof(d->cx_usage));
 
     /* TODO: replace remaining shell-based execution (system() and popen() calls in gather_data())
      * with fork()/execve() using an explicitly constructed environ[] for maximum safety in a
@@ -371,12 +371,12 @@ void gather_data(struct mon_data *d) {
 
     size = sizeof(itmp);
     if (sysctlbyname("hw.acpi.battery.state", &itmp, &size, NULL, 0) == 0) {
-        if (itmp == 7) strcpy(d->bat_source, "AC Power"); else if (itmp == 1) strcpy(d->bat_source, "Battery"); else strcpy(d->bat_source, "AC Power");
-        if (itmp == 0) strcpy(d->bat_state, "Full");
-        else if (itmp & 1) strcpy(d->bat_state, "Discharging");
-        else if (itmp & 2) strcpy(d->bat_state, "Charging");
-        else strcpy(d->bat_state, "Unknown");
-    } else { strcpy(d->bat_source, "AC Power"); strcpy(d->bat_state, "N/A"); }
+        if (itmp == 7) strlcpy(d->bat_source, "AC Power", sizeof(d->bat_source)); else if (itmp == 1) strlcpy(d->bat_source, "Battery", sizeof(d->bat_source)); else strlcpy(d->bat_source, "AC Power", sizeof(d->bat_source));
+        if (itmp == 0) strlcpy(d->bat_state, "Full", sizeof(d->bat_state));
+        else if (itmp & 1) strlcpy(d->bat_state, "Discharging", sizeof(d->bat_state));
+        else if (itmp & 2) strlcpy(d->bat_state, "Charging", sizeof(d->bat_state));
+        else strlcpy(d->bat_state, "Unknown", sizeof(d->bat_state));
+    } else { strlcpy(d->bat_source, "AC Power", sizeof(d->bat_source)); strlcpy(d->bat_state, "N/A", sizeof(d->bat_state)); }
     size = sizeof(d->bat_life); sysctlbyname("hw.acpi.battery.life", &d->bat_life, &size, NULL, 0);
 
     size = sizeof(d->freq_levels); sysctlbyname("dev.cpu.0.freq_levels", d->freq_levels, &size, NULL, 0);
@@ -442,7 +442,7 @@ void gather_data(struct mon_data *d) {
 
         if (tick_count % 5 == 0) {
             for (int i = 0; i < d->gpu_count; i++) {
-                strcpy(d->gpus[i].model, g_cache[i].model);
+                strlcpy(d->gpus[i].model, g_cache[i].model, sizeof(d->gpus[i].model));
                 d->gpus[i].active = 1;
                 d->gpus[i].freq_mhz = 0; d->gpus[i].temp_c = -1;
                 d->gpus[i].util_pct = -1; d->gpus[i].vram_used_mib = -1; d->gpus[i].vram_total_mib = -1;
@@ -517,10 +517,10 @@ void gather_data(struct mon_data *d) {
             if (strcmp(ifmd.ifmd_name, "lo0") == 0) continue;
             if (ifmd.ifmd_data.ifi_link_state != LINK_STATE_UP) continue;
             char ip_buf[INET_ADDRSTRLEN];
-            get_ip_address(ifmd.ifmd_name, ip_buf);
+            get_ip_address(ifmd.ifmd_name, ip_buf, sizeof(ip_buf));
             if (strcmp(ip_buf, "Unknown") == 0) continue;
-            strcpy(d->ifaces[d->if_count].name, ifmd.ifmd_name);
-            strcpy(d->ifaces[d->if_count].ip, ip_buf);
+            strlcpy(d->ifaces[d->if_count].name, ifmd.ifmd_name, sizeof(d->ifaces[d->if_count].name));
+            strlcpy(d->ifaces[d->if_count].ip, ip_buf, sizeof(d->ifaces[d->if_count].ip));
             d->ifaces[d->if_count].total_rx_gb = ifmd.ifmd_data.ifi_ibytes / (1024.0*1024.0*1024.0);
             d->ifaces[d->if_count].total_tx_gb = ifmd.ifmd_data.ifi_obytes / (1024.0*1024.0*1024.0);
             d->ifaces[d->if_count].is_wifi = (strncmp(ifmd.ifmd_name, "wlan", 4) == 0);
@@ -555,7 +555,7 @@ void gather_data(struct mon_data *d) {
     memcpy(history[hist_idx].cp_time, cp_time, sizeof(cp_time));
     history[hist_idx].if_count = d->if_count;
     for(int h=0; h<d->if_count; h++) {
-        strcpy(history[hist_idx].ifaces[h].name, d->ifaces[h].name);
+        strlcpy(history[hist_idx].ifaces[h].name, d->ifaces[h].name, sizeof(history[hist_idx].ifaces[h].name));
         history[hist_idx].ifaces[h].rx = (long long)(d->ifaces[h].total_rx_gb * 1024.0 * 1024.0 * 1024.0);
         history[hist_idx].ifaces[h].tx = (long long)(d->ifaces[h].total_tx_gb * 1024.0 * 1024.0 * 1024.0);
     }
@@ -574,7 +574,7 @@ void gather_data(struct mon_data *d) {
         if (targets[j][0] == '\0') continue;
         for (int i = 0; i < nfs && d->disk_count < MAX_DISKS; i++) {
             if (strcmp(fs[i].f_mntonname, targets[j]) == 0) {
-                strcpy(d->disks[d->disk_count].mount, fs[i].f_mntonname);
+                strlcpy(d->disks[d->disk_count].mount, fs[i].f_mntonname, sizeof(d->disks[d->disk_count].mount));
                 d->disks[d->disk_count].total_bytes = (long long)fs[i].f_blocks * fs[i].f_bsize;
                 d->disks[d->disk_count].used_bytes = (long long)(fs[i].f_blocks - fs[i].f_bfree) * fs[i].f_bsize;
                 d->disks[d->disk_count].usage = 100.0 * d->disks[d->disk_count].used_bytes / d->disks[d->disk_count].total_bytes;
@@ -708,7 +708,7 @@ void render(struct mon_data *d) {
         } else if (d->gpus[i].freq_mhz > 0) {
             snprintf(buf, sizeof(buf), "%.0f MHz", d->gpus[i].freq_mhz);
         } else {
-            strcpy(buf, "Active");
+            strlcpy(buf, "Active", sizeof(buf));
         }
         if (r < box_bot) print_val(r++, c2x + 2, c2inner, "  Status:", buf);
 
