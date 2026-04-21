@@ -26,6 +26,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pwd.h>
+#include <sys/user.h>
 
 #define VERSION "0.1.0"
 #define HISTORY_SIZE 10
@@ -362,12 +363,42 @@ void gather_data(struct mon_data *d) {
     size = sizeof(d->cx_usage);
     if (sysctlbyname("dev.cpu.0.cx_usage", d->cx_usage, &size, NULL, 0) != 0) strlcpy(d->cx_usage, "N/A", sizeof(d->cx_usage));
 
-    /* TODO: replace remaining shell-based execution (system() and popen() calls in gather_data())
-     * with fork()/execve() using an explicitly constructed environ[] for maximum safety in a
-     * setuid binary (see powerd_running, powerdxx_running, and all popen() call sites), and
-     * track this work in a dedicated issue so it is not overlooked. */
-    d->powerd_running = (system("/usr/bin/pgrep -q -x powerd || /usr/bin/pgrep -x powerd >/dev/null 2>&1") == 0);
-    d->powerdxx_running = (system("/usr/bin/pgrep -q -x powerdxx || /usr/bin/pgrep -x powerdxx >/dev/null 2>&1") == 0);
+    static int cached_powerd = 0;
+    static int cached_powerdxx = 0;
+
+    if (tick_count % 20 == 0) {
+        int mib[4];
+        size_t len;
+        struct kinfo_proc *kp;
+
+        mib[0] = CTL_KERN;
+        mib[1] = KERN_PROC;
+        mib[2] = KERN_PROC_PROC;
+        mib[3] = 0;
+
+        if (sysctl(mib, 3, NULL, &len, NULL, 0) == 0) {
+            len = len * 4 / 3; /* Allocate extra buffer to prevent race conditions */
+            kp = malloc(len);
+            if (kp != NULL) {
+                if (sysctl(mib, 3, kp, &len, NULL, 0) == 0) {
+                    int found_powerd = 0;
+                    int found_powerdxx = 0;
+                    int nproc = len / sizeof(struct kinfo_proc);
+                    for (int i = 0; i < nproc; i++) {
+                        if (strcmp(kp[i].ki_comm, "powerd") == 0) found_powerd = 1;
+                        else if (strcmp(kp[i].ki_comm, "powerdxx") == 0) found_powerdxx = 1;
+                        if (found_powerd && found_powerdxx) break;
+                    }
+                    cached_powerd = found_powerd;
+                    cached_powerdxx = found_powerdxx;
+                }
+                free(kp);
+            }
+        }
+    }
+
+    d->powerd_running = cached_powerd;
+    d->powerdxx_running = cached_powerdxx;
 
     size = sizeof(itmp);
     if (sysctlbyname("hw.acpi.battery.state", &itmp, &size, NULL, 0) == 0) {
