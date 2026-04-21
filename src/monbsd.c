@@ -878,13 +878,15 @@ int main() {
     while (1) {
         if (resize_pending) { get_terminal_size(); resize_pending = 0; clear_screen(); }
         gather_data(&d);
-        printf("\033[?25l"); // Hide cursor during redraw
+        printf("\033[?2026h");  // Begin synchronized update
+        printf("\033[?25l");    // Hide cursor during redraw
         render(&d);
         move_cursor(term_height, 1);
         printf("%*s", term_width, "");
         move_cursor(term_height, 1);
         printf(" 'q' to quit | %s | Tick: %u", VERSION, ++tick_count);
-        printf("\033[?25h"); // Show cursor
+        printf("\033[?25h");    // Show cursor
+        printf("\033[?2026l");  // End synchronized update
         fflush(stdout);
         char c; if (read(STDIN_FILENO, &c, 1) > 0) if (c == 'q' || c == 'Q' || c == 3) { clear_screen(); exit(0); }
         usleep(100000);
