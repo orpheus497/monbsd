@@ -158,23 +158,6 @@ void enable_raw_mode() {
     printf("\033[?25l");
 }
 
-#ifndef strlcpy
-size_t strlcpy(char *dst, const char *src, size_t siz) {
-    char *d = dst;
-    const char *s = src;
-    size_t n = siz;
-    if (n != 0) {
-        while (--n != 0) {
-            if ((*d++ = *s++) == '\0') break;
-        }
-    }
-    if (n == 0) {
-        if (siz != 0) *d = '\0';
-        while (*s++) ;
-    }
-    return (s - src - 1);
-}
-#endif
 
 void get_ip_address(const char *ifname, char *ip_buf, size_t buf_size) {
     struct ifaddrs *ifaddr, *ifa;
@@ -645,7 +628,7 @@ void draw_box(int y, int x, int h, int w, const char *title) {
 void print_val(int y, int x, int w, const char *lbl, const char *val) {
     if (w < 5 || y < 1) return;
     move_cursor(y, x);
-    printf("\033[K"); // Clear from cursor to end of line
+    for (int i = 0; i < w; i++) printf(" "); // Clear the entire field width
     move_cursor(y, x); set_color(37); 
     int lbl_len = strlen(lbl); if (lbl_len > w - 6) lbl_len = w - 6;
     printf("%.*s", lbl_len, lbl); reset_color();
@@ -662,7 +645,7 @@ void print_val(int y, int x, int w, const char *lbl, const char *val) {
 void print_bar(int y, int x, int w, double pct, const char *lbl) {
     if (w < 15 || y < 1) return;
     move_cursor(y, x);
-    printf("\033[K"); // Clear from cursor to end of line
+    for (int i = 0; i < w; i++) printf(" "); // Clear the entire field width
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     move_cursor(y, x); set_color(37); 
     int lbl_len = strlen(lbl); if (lbl_len > w / 2) lbl_len = w / 2;
@@ -700,13 +683,13 @@ void render(struct mon_data *d) {
     r++;
     if (r < box_bot) {
         move_cursor(r++, 3);
-        printf("\033[K");
+        for (int i = 0; i < col_w - 4; i++) printf(" ");
         move_cursor(r - 1, 3);
         set_color(36); printf("CPU"); reset_color();
     }
     if (r < box_bot) {
         move_cursor(r++, 3);
-        printf("\033[K");
+        for (int i = 0; i < col_w - 4; i++) printf(" ");
         move_cursor(r - 1, 3);
         printf("%.*s", col_w - 6, d->cpu_model);
     }
@@ -718,7 +701,7 @@ void render(struct mon_data *d) {
     r++;
     if (r < box_bot) {
         move_cursor(r++, 3);
-        printf("\033[K");
+        for (int i = 0; i < col_w - 4; i++) printf(" ");
         move_cursor(r - 1, 3);
         set_color(36); printf("MEMORY"); reset_color();
     }
@@ -730,7 +713,7 @@ void render(struct mon_data *d) {
     r++;
     if (r < box_bot) {
         move_cursor(r++, 3);
-        printf("\033[K");
+        for (int i = 0; i < col_w - 4; i++) printf(" ");
         move_cursor(r - 1, 3);
         set_color(36); printf("SOFTWARE & BUS"); reset_color();
     }
@@ -754,7 +737,7 @@ void render(struct mon_data *d) {
     r = box_top + 2;
     if (r < box_bot) {
         move_cursor(r++, c2x + 2);
-        printf("\033[K");
+        for (int i = 0; i < c2inner; i++) printf(" ");
         move_cursor(r - 1, c2x + 2);
         set_color(36); printf("THERMAL"); reset_color();
     }
@@ -767,7 +750,7 @@ void render(struct mon_data *d) {
 
     if (r < box_bot) {
         move_cursor(r++, c2x + 2);
-        printf("\033[K");
+        for (int i = 0; i < c2inner; i++) printf(" ");
         move_cursor(r - 1, c2x + 2);
         set_color(36); printf("GPU HARDWARE"); reset_color();
     }
@@ -776,7 +759,7 @@ void render(struct mon_data *d) {
     }
     for (int i = 0; i < d->gpu_count && r < box_bot; i++) {
         move_cursor(r++, c2x + 2);
-        printf("\033[K");
+        for (int k = 0; k < c2inner; k++) printf(" ");
         move_cursor(r - 1, c2x + 2);
         printf("%.*s", c2inner - 2, d->gpus[i].model);
 
@@ -811,7 +794,7 @@ void render(struct mon_data *d) {
 
     if (r < box_bot) {
         move_cursor(r++, c2x + 2);
-        printf("\033[K");
+        for (int i = 0; i < c2inner; i++) printf(" ");
         move_cursor(r - 1, c2x + 2);
         set_color(36); printf("POWER & ACPI"); reset_color();
     }
@@ -820,14 +803,14 @@ void render(struct mon_data *d) {
     if (r < box_bot) print_val(r++, c2x + 2, c2inner, "Cx Lowest:", d->cx_lowest);
     if (r < box_bot) {
         move_cursor(r++, c2x + 2);
-        printf("\033[K");
+        for (int i = 0; i < c2inner; i++) printf(" ");
         move_cursor(r - 1, c2x + 2);
         printf("Cx Usage: %.*s", c2inner - 10, d->cx_usage);
     }
     r++;
     if (r < box_bot) {
         move_cursor(r++, c2x + 2);
-        printf("\033[K");
+        for (int i = 0; i < c2inner; i++) printf(" ");
         move_cursor(r - 1, c2x + 2);
         set_color(36); printf("BATTERY"); reset_color();
     }
@@ -837,7 +820,7 @@ void render(struct mon_data *d) {
     r++;
     if (r < box_bot) {
         move_cursor(r++, c2x + 2);
-        printf("\033[K");
+        for (int i = 0; i < c2inner; i++) printf(" ");
         move_cursor(r - 1, c2x + 2);
         set_color(36); printf("FREQ RANGE"); reset_color();
     }
@@ -845,7 +828,7 @@ void render(struct mon_data *d) {
     while (*pp && r < box_bot) {
         char level[32]; int n; if (sscanf(pp, "%31s%n", level, &n) != 1) break;
         move_cursor(r++, c2x + 4);
-        printf("\033[K");
+        for (int i = 0; i < c2inner - 2; i++) printf(" ");
         move_cursor(r - 1, c2x + 4);
         printf("%s MHz", level); pp += n; while (*pp == ' ') pp++;
     }
@@ -858,7 +841,7 @@ void render(struct mon_data *d) {
 
     for (int i = 0; i < d->if_count && r < box_bot; i++) {
         move_cursor(r++, c3x + 2);
-        printf("\033[K");
+        for (int k = 0; k < c3inner; k++) printf(" ");
         move_cursor(r - 1, c3x + 2);
         set_color(36);
         printf("NET: %s (%s)", d->ifaces[i].name, d->ifaces[i].is_wifi ? "WiFi" : "Ethernet");
@@ -877,7 +860,7 @@ void render(struct mon_data *d) {
 
     if (r < box_bot) {
         move_cursor(r++, c3x + 2);
-        printf("\033[K");
+        for (int i = 0; i < c3inner; i++) printf(" ");
         move_cursor(r - 1, c3x + 2);
         set_color(36); printf("SWAP"); reset_color();
     }
@@ -888,13 +871,13 @@ void render(struct mon_data *d) {
 
     if (r < box_bot) {
         move_cursor(r++, c3x + 2);
-        printf("\033[K");
+        for (int i = 0; i < c3inner; i++) printf(" ");
         move_cursor(r - 1, c3x + 2);
         set_color(36); printf("DISKS"); reset_color();
     }
     for (int i = 0; i < d->disk_count && r < box_bot; i++) {
         move_cursor(r++, c3x + 2);
-        printf("\033[K");
+        for (int k = 0; k < c3inner; k++) printf(" ");
         move_cursor(r - 1, c3x + 2);
         printf("%.*s", c3inner, d->disks[i].mount);
         if (r < box_bot) {
@@ -961,7 +944,7 @@ int main() {
         gather_data(&d);
         render(&d);
         move_cursor(term_height, 1);
-        printf("\033[K");
+        for (int i = 0; i < term_width; i++) printf(" ");
         move_cursor(term_height, 1);
         printf(" 'q' to quit | %s | Tick: %u", VERSION, ++tick_count); fflush(stdout);
         char c; if (read(STDIN_FILENO, &c, 1) > 0) if (c == 'q' || c == 'Q' || c == 3) { clear_screen(); exit(0); }
