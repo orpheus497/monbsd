@@ -332,7 +332,14 @@ void gather_data(struct mon_data *d) {
         d->linux_count = 0;
         DIR *dir = opendir("/compat/linux/usr/bin");
         if (dir) { struct dirent *e; while ((e = readdir(dir))) if (e->d_name[0] != '.') d->linux_count++; closedir(dir); }
-        d->pci_device_count = direct_pci_count();
+
+        static int pci_count_cached = 0;
+        static int cached_pci_count = 0;
+        if (!pci_count_cached) {
+            cached_pci_count = direct_pci_count();
+            pci_count_cached = 1;
+        }
+        d->pci_device_count = cached_pci_count;
 
         d->user_bin_count = 0;
         if (d->home_dir[0]) {
