@@ -560,8 +560,30 @@ void gather_data(struct mon_data *d) {
     }
     history[hist_idx].ts = ts; history[hist_idx].valid = 1; hist_idx = (hist_idx + 1) % HISTORY_SIZE;
 
-    FILE *fsw = popen("/usr/sbin/swapinfo -k 2>/dev/null", "r"); d->swap_total = d->swap_used = 0;
-    if (fsw) { char line[256]; fgets(line, 256, fsw); while (fgets(line, 256, fsw)) { long t, u; if (sscanf(line, "%*s %ld %ld", &t, &u) == 2) { d->swap_total += (long long)t * 1024; d->swap_used += (long long)u * 1024; } } pclose(fsw); }
+    static long long cached_swap_total = 0, cached_swap_used = 0;
+    static int swap_init = 0;
+    if (!swap_init || tick_count % 50 == 0) {
+        FILE *fsw = popen("/usr/sbin/swapinfo -k 2>/dev/null", "r");
+        if (fsw) {
+            char line[256];
+            long long total = 0, used = 0;
+            if (fgets(line, 256, fsw)) { // skip header
+                while (fgets(line, 256, fsw)) {
+                    long t, u;
+                    if (sscanf(line, "%*s %ld %ld", &t, &u) == 2) {
+                        total += (long long)t * 1024;
+                        used += (long long)u * 1024;
+                    }
+                }
+            }
+            if (pclose(fsw) == 0 || total > 0) {
+                cached_swap_total = total;
+                cached_swap_used = used;
+            }
+            swap_init = 1;
+        }
+    }
+    d->swap_total = cached_swap_total; d->swap_used = cached_swap_used;
     d->swap_usage = (d->swap_total > 0) ? (100.0 * d->swap_used / d->swap_total) : 0;
 
     int nfs = getfsstat(NULL, 0, MNT_NOWAIT);
