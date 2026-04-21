@@ -26,6 +26,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pwd.h>
+#include <sys/wait.h>
 
 #define VERSION "0.1.0"
 #define HISTORY_SIZE 10
@@ -33,6 +34,60 @@
 #define MAX_NET_IF 4
 #define MAX_GPUS 2
 #define NVIDIA_SMI_PATH "/usr/local/bin/nvidia-smi"
+
+static int safe_exec_check(const char *path, char *const argv[]) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull != -1) {
+            if (devnull != STDOUT_FILENO) dup2(devnull, STDOUT_FILENO);
+            if (devnull != STDERR_FILENO) dup2(devnull, STDERR_FILENO);
+            if (devnull != STDOUT_FILENO && devnull != STDERR_FILENO) close(devnull);
+        }
+        char *envp[] = {"PATH=/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin", NULL};
+        execve(path, argv, envp);
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return -1;
+}
+
+static FILE *popen_safe(const char *path, char *const argv[], pid_t *pid_out) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return NULL;
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return NULL;
+    }
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull != -1) {
+            if (devnull != STDERR_FILENO) dup2(devnull, STDERR_FILENO);
+            if (devnull != STDERR_FILENO) close(devnull);
+        }
+        char *envp[] = {"PATH=/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin", NULL};
+        execve(path, argv, envp);
+        _exit(127);
+    }
+    close(pipefd[1]);
+    *pid_out = pid;
+    return fdopen(pipefd[0], "r");
+}
+
+static void pclose_safe(FILE *fp, pid_t pid) {
+    if (fp) fclose(fp);
+    if (pid > 0) waitpid(pid, NULL, 0);
+}
 
 struct gpu_data {
     char model[128];
@@ -325,10 +380,33 @@ void gather_data(struct mon_data *d) {
     static int soft_ticks = 0;
     if (soft_ticks-- <= 0) {
         soft_ticks = 10;
-        FILE *fp = popen("/usr/local/sbin/pkg info -q 2>/dev/null | /usr/bin/wc -l", "r");
-        if (fp) { fscanf(fp, "%d", &d->pkg_count); pclose(fp); }
-        fp = popen("/usr/local/sbin/pkg query '%r' 2>/dev/null | /usr/bin/grep -ic 'local'", "r");
-        if (fp) { fscanf(fp, "%d", &d->ports_count); pclose(fp); }
+        pid_t p_pid;
+        char *pkg_info_argv[] = {"pkg", "info", "-q", NULL};
+        FILE *fp = popen_safe("/usr/local/sbin/pkg", pkg_info_argv, &p_pid);
+        if (fp) {
+            d->pkg_count = 0;
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+                for (size_t i = 0; i < n; i++) {
+                    if (buf[i] == '\n') d->pkg_count++;
+                }
+            }
+            pclose_safe(fp, p_pid);
+        }
+
+        char *pkg_query_argv[] = {"pkg", "query", "%r", NULL};
+        fp = popen_safe("/usr/local/sbin/pkg", pkg_query_argv, &p_pid);
+        if (fp) {
+            d->ports_count = 0;
+            char line[256];
+            while (fgets(line, sizeof(line), fp)) {
+                if (strcasestr(line, "local")) {
+                    d->ports_count++;
+                }
+            }
+            pclose_safe(fp, p_pid);
+        }
         d->linux_count = 0;
         DIR *dir = opendir("/compat/linux/usr/bin");
         if (dir) { struct dirent *e; while ((e = readdir(dir))) if (e->d_name[0] != '.') d->linux_count++; closedir(dir); }
@@ -362,12 +440,10 @@ void gather_data(struct mon_data *d) {
     size = sizeof(d->cx_usage);
     if (sysctlbyname("dev.cpu.0.cx_usage", d->cx_usage, &size, NULL, 0) != 0) strlcpy(d->cx_usage, "N/A", sizeof(d->cx_usage));
 
-    /* TODO: replace remaining shell-based execution (system() and popen() calls in gather_data())
-     * with fork()/execve() using an explicitly constructed environ[] for maximum safety in a
-     * setuid binary (see powerd_running, powerdxx_running, and all popen() call sites), and
-     * track this work in a dedicated issue so it is not overlooked. */
-    d->powerd_running = (system("/usr/bin/pgrep -q -x powerd || /usr/bin/pgrep -x powerd >/dev/null 2>&1") == 0);
-    d->powerdxx_running = (system("/usr/bin/pgrep -q -x powerdxx || /usr/bin/pgrep -x powerdxx >/dev/null 2>&1") == 0);
+    char *pgrep_powerd_argv[] = {"pgrep", "-q", "-x", "powerd", NULL};
+    d->powerd_running = (safe_exec_check("/bin/pgrep", pgrep_powerd_argv) == 0 || safe_exec_check("/usr/bin/pgrep", pgrep_powerd_argv) == 0);
+    char *pgrep_powerdxx_argv[] = {"pgrep", "-q", "-x", "powerdxx", NULL};
+    d->powerdxx_running = (safe_exec_check("/bin/pgrep", pgrep_powerdxx_argv) == 0 || safe_exec_check("/usr/bin/pgrep", pgrep_powerdxx_argv) == 0);
 
     size = sizeof(itmp);
     if (sysctlbyname("hw.acpi.battery.state", &itmp, &size, NULL, 0) == 0) {
@@ -391,7 +467,9 @@ void gather_data(struct mon_data *d) {
         static int has_nvidia_smi = -1;
 
         if (!g_init) {
-            FILE *fp = popen("/usr/sbin/pciconf -lv 2>/dev/null", "r");
+            pid_t p_pid;
+            char *pciconf_argv[] = {"pciconf", "-lv", NULL};
+            FILE *fp = popen_safe("/usr/sbin/pciconf", pciconf_argv, &p_pid);
             if (fp) {
                 char line[256];
                 int in_gpu = 0;
@@ -430,7 +508,7 @@ void gather_data(struct mon_data *d) {
                         }
                     }
                 }
-                pclose(fp);
+                pclose_safe(fp, p_pid);
             }
             if (has_nvidia_smi < 0) {
                 has_nvidia_smi = (access(NVIDIA_SMI_PATH, X_OK) == 0) ? 1 : 0;
@@ -448,9 +526,9 @@ void gather_data(struct mon_data *d) {
             }
 
             if (has_nvidia_smi) {
-                FILE *fp = popen(NVIDIA_SMI_PATH
-                    " --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu"
-                    " --format=csv,noheader,nounits 2>/dev/null", "r");
+                pid_t p_pid;
+                char *nvidia_argv[] = {"nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits", NULL};
+                FILE *fp = popen_safe(NVIDIA_SMI_PATH, nvidia_argv, &p_pid);
                 if (fp) {
                     char sbuf[256];
                     int nv_line = 0;
@@ -473,7 +551,7 @@ void gather_data(struct mon_data *d) {
                             nv_line++;
                         }
                     }
-                    pclose(fp);
+                    pclose_safe(fp, p_pid);
                 }
             }
 
@@ -560,8 +638,10 @@ void gather_data(struct mon_data *d) {
     }
     history[hist_idx].ts = ts; history[hist_idx].valid = 1; hist_idx = (hist_idx + 1) % HISTORY_SIZE;
 
-    FILE *fsw = popen("/usr/sbin/swapinfo -k 2>/dev/null", "r"); d->swap_total = d->swap_used = 0;
-    if (fsw) { char line[256]; fgets(line, 256, fsw); while (fgets(line, 256, fsw)) { long t, u; if (sscanf(line, "%*s %ld %ld", &t, &u) == 2) { d->swap_total += (long long)t * 1024; d->swap_used += (long long)u * 1024; } } pclose(fsw); }
+    pid_t swapinfo_pid;
+    char *swapinfo_argv[] = {"swapinfo", "-k", NULL};
+    FILE *fsw = popen_safe("/usr/sbin/swapinfo", swapinfo_argv, &swapinfo_pid); d->swap_total = d->swap_used = 0;
+    if (fsw) { char line[256]; fgets(line, 256, fsw); while (fgets(line, 256, fsw)) { long t, u; if (sscanf(line, "%*s %ld %ld", &t, &u) == 2) { d->swap_total += (long long)t * 1024; d->swap_used += (long long)u * 1024; } } pclose_safe(fsw, swapinfo_pid); }
     d->swap_usage = (d->swap_total > 0) ? (100.0 * d->swap_used / d->swap_total) : 0;
 
     int nfs = getfsstat(NULL, 0, MNT_NOWAIT);
