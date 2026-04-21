@@ -417,8 +417,7 @@ void gather_data(struct mon_data *d) {
                             char *end = strchr(start + 1, '\'');
                             if (end) {
                                 *end = '\0';
-                                strncpy(g_cache[g_cached_count].model, start + 1, 127);
-                                g_cache[g_cached_count].model[127] = '\0';
+                                strlcpy(g_cache[g_cached_count].model, start + 1, sizeof(g_cache[g_cached_count].model));
                                 g_cache[g_cached_count].is_nvidia = pending_nvidia ||
                                     (strstr(g_cache[g_cached_count].model, "NVIDIA") != NULL) ||
                                     (strstr(g_cache[g_cached_count].model, "GeForce") != NULL) ||
@@ -801,15 +800,15 @@ int main() {
         }
         struct passwd *pw = getpwuid(target_uid);
         if (pw != NULL && pw->pw_dir != NULL) {
-            strncpy(resolved_home_dir, pw->pw_dir, sizeof(resolved_home_dir) - 1);
+            strlcpy(resolved_home_dir, pw->pw_dir, sizeof(resolved_home_dir));
             struct statfs home_fs;
             if (statfs(pw->pw_dir, &home_fs) == 0) {
                 if (!(home_fs.f_mntonname[0] == '/' && home_fs.f_mntonname[1] == '\0')) {
-                    strncpy(resolved_home, home_fs.f_mntonname, sizeof(resolved_home) - 1);
+                    strlcpy(resolved_home, home_fs.f_mntonname, sizeof(resolved_home));
                 }
             } else {
                 if (!(pw->pw_dir[0] == '/' && pw->pw_dir[1] == '\0')) {
-                    strncpy(resolved_home, pw->pw_dir, sizeof(resolved_home) - 1);
+                    strlcpy(resolved_home, pw->pw_dir, sizeof(resolved_home));
                 }
             }
         }
@@ -826,8 +825,8 @@ int main() {
     }
     free(term);
     struct mon_data d = {0};
-    strncpy(d.home_path, resolved_home, sizeof(d.home_path) - 1);
-    strncpy(d.home_dir, resolved_home_dir, sizeof(d.home_dir) - 1);
+    strlcpy(d.home_path, resolved_home, sizeof(d.home_path));
+    strlcpy(d.home_dir, resolved_home_dir, sizeof(d.home_dir));
     enable_raw_mode();
     signal(SIGWINCH, handle_sigwinch);
     get_terminal_size();
