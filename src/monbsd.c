@@ -586,7 +586,6 @@ void gather_data(struct mon_data *d) {
     }
     d->swap_total = cached_swap_total; d->swap_used = cached_swap_used;
 
-
     d->swap_usage = (d->swap_total > 0) ? (100.0 * d->swap_used / d->swap_total) : 0;
 
     int nfs = getfsstat(NULL, 0, MNT_NOWAIT);
