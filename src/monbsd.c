@@ -1,4 +1,5 @@
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -313,6 +314,71 @@ static int count_dir_executables(const char *path) {
     return count;
 }
 
+static int run_pgrep(const char *proc_name, int use_q) {
+    pid_t pid = fork();
+    if (pid == -1) return -1;
+
+    if (pid == 0) {
+        /* Child process: redirect stdout/stderr to /dev/null */
+        int fd = open("/dev/null", O_WRONLY);
+        if (fd != -1) {
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            if (fd > STDERR_FILENO) {
+                close(fd);
+            }
+        }
+
+        /* Construct a minimal clean environment */
+        char *envp[] = { "PATH=/bin:/usr/bin:/sbin:/usr/sbin", NULL };
+
+        if (use_q) {
+            char *argv[] = { "/usr/bin/pgrep", "-q", "-x", (char *)proc_name, NULL };
+            execve(argv[0], argv, envp);
+            argv[0] = "/bin/pgrep";
+            execve(argv[0], argv, envp);
+        } else {
+            char *argv[] = { "/usr/bin/pgrep", "-x", (char *)proc_name, NULL };
+            execve(argv[0], argv, envp);
+            argv[0] = "/bin/pgrep";
+            execve(argv[0], argv, envp);
+        }
+
+        _exit(127); /* Command not found or execution failed */
+    }
+
+    /* Parent process */
+    int status;
+    while (waitpid(pid, &status, 0) == -1) {
+        if (errno != EINTR) {
+            return -1;
+        }
+    }
+
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return -1;
+}
+
+static int check_process_running(const char *proc_name) {
+    int exit_code = run_pgrep(proc_name, 1); /* Try with -q first */
+
+    if (exit_code == 0) {
+        return 1; /* Process is running */
+    } else if (exit_code == 1) {
+        return 0; /* Process is not running (pgrep standard exit for no match) */
+    } else {
+        /*
+         * If exit_code > 1 (e.g., 2 or 3), it means pgrep syntax error
+         * which could happen if -q is not supported.
+         * Try again without -q.
+         */
+        exit_code = run_pgrep(proc_name, 0);
+        return (exit_code == 0) ? 1 : 0;
+    }
+}
+
 void gather_data(struct mon_data *d) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
@@ -410,12 +476,11 @@ void gather_data(struct mon_data *d) {
     size = sizeof(d->cx_usage);
     if (sysctlbyname("dev.cpu.0.cx_usage", d->cx_usage, &size, NULL, 0) != 0) strlcpy(d->cx_usage, "N/A", sizeof(d->cx_usage));
 
-    /* TODO: replace remaining shell-based execution (system() and popen() calls in gather_data())
+    /* TODO: replace remaining shell-based execution (popen() calls in gather_data())
      * with fork()/execve() using an explicitly constructed environ[] for maximum safety in a
-     * setuid binary (see powerd_running, powerdxx_running, and all popen() call sites), and
-     * track this work in a dedicated issue so it is not overlooked. */
-    d->powerd_running = (system("/usr/bin/pgrep -q -x powerd || /usr/bin/pgrep -x powerd >/dev/null 2>&1") == 0);
-    d->powerdxx_running = (system("/usr/bin/pgrep -q -x powerdxx || /usr/bin/pgrep -x powerdxx >/dev/null 2>&1") == 0);
+     * setuid binary (see all popen() call sites), and track this work in a dedicated issue so it is not overlooked. */
+    d->powerd_running = check_process_running("powerd");
+    d->powerdxx_running = check_process_running("powerdxx");
 
     size = sizeof(itmp);
     if (sysctlbyname("hw.acpi.battery.state", &itmp, &size, NULL, 0) == 0) {
