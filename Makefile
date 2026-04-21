@@ -7,7 +7,8 @@ MANDIR= ${PREFIX}/man/man8
 TARGET= monbsd
 SRC= src/monbsd.c
 
-TESTS= tests/test_aperf tests/test_compile tests/test_cpuctl tests/test_cpuid tests/test_pci tests/test_statfs tests/test_uptime
+TEST_SRCS= tests/test_aperf.c tests/test_compile.c tests/test_cpuctl.c tests/test_cpuid.c tests/test_pci.c tests/test_statfs.c tests/test_uptime.c
+TESTS= $(TEST_SRCS:.c=)
 
 all: ${TARGET}
 
@@ -16,10 +17,8 @@ ${TARGET}: ${SRC}
 
 tests: ${TESTS}
 
-.for _test in ${TESTS}
-${_test}: ${_test}.c
-	${CC} ${CFLAGS} ${_test}.c -o ${_test}
-.endfor
+tests/%: tests/%.c
+	${CC} ${CFLAGS} $< -o $@
 
 clean:
 	rm -f ${TARGET} ${TESTS}
