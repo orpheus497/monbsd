@@ -26,6 +26,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pwd.h>
+#include <sys/wait.h>
 
 #define VERSION "0.1.0"
 #define HISTORY_SIZE 10
@@ -120,6 +121,46 @@ struct {
     int valid;
 } history[HISTORY_SIZE];
 int hist_idx = 0;
+
+static pid_t safe_exec_read(const char *path, char *const argv[], FILE **out_fp) {
+    int pfd[2];
+    if (pipe(pfd) < 0) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pfd[0]);
+        close(pfd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(pfd[0]);
+        if (pfd[1] != STDOUT_FILENO) {
+            dup2(pfd[1], STDOUT_FILENO);
+            close(pfd[1]);
+        }
+        int fd_null = open("/dev/null", O_WRONLY);
+        if (fd_null >= 0) {
+            dup2(fd_null, STDERR_FILENO);
+            if (fd_null != STDERR_FILENO) close(fd_null);
+        }
+        char *const envp[] = {
+            "PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin",
+            NULL
+        };
+        execve(path, argv, envp);
+        _exit(127);
+    }
+
+    close(pfd[1]);
+    *out_fp = fdopen(pfd[0], "r");
+    if (!*out_fp) {
+        close(pfd[0]);
+        waitpid(pid, NULL, 0);
+        return -1;
+    }
+    return pid;
+}
 
 struct termios orig_termios;
 int term_width = 120, term_height = 40;
@@ -448,10 +489,15 @@ void gather_data(struct mon_data *d) {
             }
 
             if (has_nvidia_smi) {
-                FILE *fp = popen(NVIDIA_SMI_PATH
-                    " --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu"
-                    " --format=csv,noheader,nounits 2>/dev/null", "r");
-                if (fp) {
+                FILE *fp;
+                char *const nvsmi_argv[] = {
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+                    "--format=csv,noheader,nounits",
+                    NULL
+                };
+                pid_t pid = safe_exec_read(NVIDIA_SMI_PATH, nvsmi_argv, &fp);
+                if (pid > 0 && fp) {
                     char sbuf[256];
                     int nv_line = 0;
                     while (fgets(sbuf, sizeof(sbuf), fp)) {
@@ -473,7 +519,8 @@ void gather_data(struct mon_data *d) {
                             nv_line++;
                         }
                     }
-                    pclose(fp);
+                    fclose(fp);
+                    waitpid(pid, NULL, 0);
                 }
             }
 
