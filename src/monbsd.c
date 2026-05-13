@@ -38,28 +38,6 @@
 #define MAX_GPUS 2
 #define NVIDIA_SMI_PATH "/usr/local/bin/nvidia-smi"
 
-static int safe_exec_check(const char *path, char *const argv[]) {
-    pid_t pid = fork();
-    if (pid < 0) return -1;
-    if (pid == 0) {
-        int devnull = open("/dev/null", O_RDWR);
-        if (devnull != -1) {
-            if (devnull != STDOUT_FILENO) dup2(devnull, STDOUT_FILENO);
-            if (devnull != STDERR_FILENO) dup2(devnull, STDERR_FILENO);
-            if (devnull != STDOUT_FILENO && devnull != STDERR_FILENO) close(devnull);
-        }
-        char *envp[] = {"PATH=/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin", NULL};
-        execve(path, argv, envp);
-        _exit(127);
-    }
-    int status;
-    waitpid(pid, &status, 0);
-    if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
-    }
-    return -1;
-}
-
 static FILE *popen_safe(const char *path, char *const argv[], pid_t *pid_out) {
     int pipefd[2];
     if (pipe(pipefd) < 0) return NULL;
@@ -189,46 +167,6 @@ struct {
     int valid;
 } history[HISTORY_SIZE];
 int hist_idx = 0;
-
-static pid_t safe_exec_read(const char *path, char *const argv[], FILE **out_fp) {
-    int pfd[2];
-    if (pipe(pfd) < 0) return -1;
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pfd[0]);
-        close(pfd[1]);
-        return -1;
-    }
-
-    if (pid == 0) {
-        close(pfd[0]);
-        if (pfd[1] != STDOUT_FILENO) {
-            dup2(pfd[1], STDOUT_FILENO);
-            close(pfd[1]);
-        }
-        int fd_null = open("/dev/null", O_WRONLY);
-        if (fd_null >= 0) {
-            dup2(fd_null, STDERR_FILENO);
-            if (fd_null != STDERR_FILENO) close(fd_null);
-        }
-        char *const envp[] = {
-            "PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin",
-            NULL
-        };
-        execve(path, argv, envp);
-        _exit(127);
-    }
-
-    close(pfd[1]);
-    *out_fp = fdopen(pfd[0], "r");
-    if (!*out_fp) {
-        close(pfd[0]);
-        waitpid(pid, NULL, 0);
-        return -1;
-    }
-    return pid;
-}
 
 struct termios orig_termios;
 int term_width = 120, term_height = 40;
@@ -540,8 +478,11 @@ void gather_data(struct mon_data *d) {
         DIR *dir = opendir("/compat/linux/usr/bin");
         if (dir) { struct dirent *e; while ((e = readdir(dir))) if (e->d_name[0] != '.') d->linux_count++; closedir(dir); }
         static int cached_pci_count = -1;
-        if (cached_pci_count == -1) {
-            cached_pci_count = direct_pci_count();
+        if (cached_pci_count == -1 || tick_count % 100 == 0) {
+            int current_count = direct_pci_count();
+            if (current_count >= 0) {
+                cached_pci_count = current_count;
+            }
         }
         d->pci_device_count = cached_pci_count;
     }
@@ -830,8 +771,8 @@ void gather_data(struct mon_data *d) {
             pclose_safe(fsw, swapinfo_pid);
             cached_swap_total = total;
             cached_swap_used = used;
+            swap_init = 1;
         }
-        swap_init = 1;
     }
     d->swap_total = cached_swap_total; d->swap_used = cached_swap_used;
     d->swap_usage = (d->swap_total > 0) ? (100.0 * d->swap_used / d->swap_total) : 0;
