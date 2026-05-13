@@ -70,8 +70,10 @@ static FILE *popen_safe(const char *path, char *const argv[], pid_t *pid_out) {
     }
     if (pid == 0) {
         close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        close(pipefd[1]);
+        if (pipefd[1] != STDOUT_FILENO) {
+            dup2(pipefd[1], STDOUT_FILENO);
+            close(pipefd[1]);
+        }
         int devnull = open("/dev/null", O_RDWR);
         if (devnull != -1) {
             if (devnull != STDERR_FILENO) dup2(devnull, STDERR_FILENO);
@@ -82,8 +84,14 @@ static FILE *popen_safe(const char *path, char *const argv[], pid_t *pid_out) {
         _exit(127);
     }
     close(pipefd[1]);
+    FILE *fp = fdopen(pipefd[0], "r");
+    if (!fp) {
+        close(pipefd[0]);
+        waitpid(pid, NULL, 0);
+        return NULL;
+    }
     *pid_out = pid;
-    return fdopen(pipefd[0], "r");
+    return fp;
 }
 
 static void pclose_safe(FILE *fp, pid_t pid) {
@@ -411,7 +419,7 @@ void gather_data(struct mon_data *d) {
         fp = popen_safe("/usr/local/sbin/pkg", pkg_query_argv, &p_pid);
         if (fp) {
             d->ports_count = 0;
-            char line[256];
+            char line[1024];
             while (fgets(line, sizeof(line), fp)) {
                 if (strcasestr(line, "local")) {
                     d->ports_count++;
@@ -423,11 +431,9 @@ void gather_data(struct mon_data *d) {
         DIR *dir = opendir("/compat/linux/usr/bin");
         if (dir) { struct dirent *e; while ((e = readdir(dir))) if (e->d_name[0] != '.') d->linux_count++; closedir(dir); }
 
-        static int pci_count_cached = 0;
-        static int cached_pci_count = 0;
-        if (!pci_count_cached) {
+        static int cached_pci_count = -1;
+        if (cached_pci_count == -1) {
             cached_pci_count = direct_pci_count();
-            pci_count_cached = 1;
         }
         d->pci_device_count = cached_pci_count;
 
@@ -522,7 +528,7 @@ void gather_data(struct mon_data *d) {
             char *pciconf_argv[] = {"pciconf", "-lv", NULL};
             FILE *fp = popen_safe("/usr/sbin/pciconf", pciconf_argv, &p_pid);
             if (fp) {
-                char line[256];
+                char line[1024];
                 int in_gpu = 0;
                 int pending_nvidia = 0;
                 while (fgets(line, sizeof(line), fp)) {
@@ -581,7 +587,7 @@ void gather_data(struct mon_data *d) {
                 char *nvidia_argv[] = {"nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits", NULL};
                 FILE *fp = popen_safe(NVIDIA_SMI_PATH, nvidia_argv, &p_pid);
                 if (fp) {
-                    char sbuf[256];
+                    char sbuf[1024];
                     int nv_line = 0;
                     while (fgets(sbuf, sizeof(sbuf), fp)) {
                         float util; int mem_used, mem_total, gtemp;
@@ -696,7 +702,7 @@ void gather_data(struct mon_data *d) {
         char *swapinfo_argv[] = {"swapinfo", "-k", NULL};
         FILE *fsw = popen_safe("/usr/sbin/swapinfo", swapinfo_argv, &swapinfo_pid);
         if (fsw) {
-            char line[256];
+            char line[1024];
             long long total = 0, used = 0;
             if (fgets(line, sizeof(line), fsw)) { // skip header
                 while (fgets(line, sizeof(line), fsw)) {
