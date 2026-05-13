@@ -1,4 +1,5 @@
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -168,6 +169,9 @@ struct mon_data {
     int disk_count;
     char home_path[MAXPATHLEN];
     char home_dir[MAXPATHLEN];
+
+    int user_bin_ticks;
+    int cached_user_bin_count;
 };
 
 struct iface_history {
@@ -185,6 +189,46 @@ struct {
     int valid;
 } history[HISTORY_SIZE];
 int hist_idx = 0;
+
+static pid_t safe_exec_read(const char *path, char *const argv[], FILE **out_fp) {
+    int pfd[2];
+    if (pipe(pfd) < 0) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pfd[0]);
+        close(pfd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(pfd[0]);
+        if (pfd[1] != STDOUT_FILENO) {
+            dup2(pfd[1], STDOUT_FILENO);
+            close(pfd[1]);
+        }
+        int fd_null = open("/dev/null", O_WRONLY);
+        if (fd_null >= 0) {
+            dup2(fd_null, STDERR_FILENO);
+            if (fd_null != STDERR_FILENO) close(fd_null);
+        }
+        char *const envp[] = {
+            "PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin",
+            NULL
+        };
+        execve(path, argv, envp);
+        _exit(127);
+    }
+
+    close(pfd[1]);
+    *out_fp = fdopen(pfd[0], "r");
+    if (!*out_fp) {
+        close(pfd[0]);
+        waitpid(pid, NULL, 0);
+        return -1;
+    }
+    return pid;
+}
 
 struct termios orig_termios;
 int term_width = 120, term_height = 40;
@@ -344,6 +388,71 @@ static int count_dir_executables(const char *path) {
     return count;
 }
 
+static int run_pgrep(const char *proc_name, int use_q) {
+    pid_t pid = fork();
+    if (pid == -1) return -1;
+
+    if (pid == 0) {
+        /* Child process: redirect stdout/stderr to /dev/null */
+        int fd = open("/dev/null", O_WRONLY);
+        if (fd != -1) {
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            if (fd > STDERR_FILENO) {
+                close(fd);
+            }
+        }
+
+        /* Construct a minimal clean environment */
+        char *envp[] = { "PATH=/bin:/usr/bin:/sbin:/usr/sbin", NULL };
+
+        if (use_q) {
+            char *argv[] = { "/usr/bin/pgrep", "-q", "-x", (char *)proc_name, NULL };
+            execve(argv[0], argv, envp);
+            argv[0] = "/bin/pgrep";
+            execve(argv[0], argv, envp);
+        } else {
+            char *argv[] = { "/usr/bin/pgrep", "-x", (char *)proc_name, NULL };
+            execve(argv[0], argv, envp);
+            argv[0] = "/bin/pgrep";
+            execve(argv[0], argv, envp);
+        }
+
+        _exit(127); /* Command not found or execution failed */
+    }
+
+    /* Parent process */
+    int status;
+    while (waitpid(pid, &status, 0) == -1) {
+        if (errno != EINTR) {
+            return -1;
+        }
+    }
+
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return -1;
+}
+
+static int check_process_running(const char *proc_name) {
+    int exit_code = run_pgrep(proc_name, 1); /* Try with -q first */
+
+    if (exit_code == 0) {
+        return 1; /* Process is running */
+    } else if (exit_code == 1) {
+        return 0; /* Process is not running (pgrep standard exit for no match) */
+    } else {
+        /*
+         * If exit_code > 1 (e.g., 2 or 3), it means pgrep syntax error
+         * which could happen if -q is not supported.
+         * Try again without -q.
+         */
+        exit_code = run_pgrep(proc_name, 0);
+        return (exit_code == 0) ? 1 : 0;
+    }
+}
+
 void gather_data(struct mon_data *d) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
@@ -430,24 +539,27 @@ void gather_data(struct mon_data *d) {
         d->linux_count = 0;
         DIR *dir = opendir("/compat/linux/usr/bin");
         if (dir) { struct dirent *e; while ((e = readdir(dir))) if (e->d_name[0] != '.') d->linux_count++; closedir(dir); }
-
         static int cached_pci_count = -1;
         if (cached_pci_count == -1) {
             cached_pci_count = direct_pci_count();
         }
         d->pci_device_count = cached_pci_count;
+    }
 
-        d->user_bin_count = 0;
+    if (d->user_bin_ticks-- <= 0) {
+        d->user_bin_ticks = 600;
+        d->cached_user_bin_count = 0;
         if (d->home_dir[0]) {
             char probe[MAXPATHLEN];
             snprintf(probe, sizeof(probe), "%s/.local/bin", d->home_dir);
-            d->user_bin_count += count_dir_executables(probe);
+            d->cached_user_bin_count += count_dir_executables(probe);
             snprintf(probe, sizeof(probe), "%s/bin", d->home_dir);
-            d->user_bin_count += count_dir_executables(probe);
+            d->cached_user_bin_count += count_dir_executables(probe);
             snprintf(probe, sizeof(probe), "%s/local/bin", d->home_dir);
-            d->user_bin_count += count_dir_executables(probe);
+            d->cached_user_bin_count += count_dir_executables(probe);
         }
     }
+    d->user_bin_count = d->cached_user_bin_count;
 
     d->cpu_temp = direct_cpu_temp();
     
@@ -788,15 +900,7 @@ void print_bar(int y, int x, int w, double pct, const char *lbl) {
     printf("] %5.1f%%", pct);
 }
 
-void render(struct mon_data *d) {
-    int col_w = term_width / 3 - 1; if (col_w < 30) col_w = 30;
-    int h = term_height - 6;
-    int box_top = 5;
-    int box_bot = box_top + h - 1;
-
-    move_cursor(2, (term_width - 24) / 2); printf("║ FreeBSD System Monitor ║");
-    move_cursor(3, (term_width - 24) / 2); printf("╚════════════════════════╝");
-
+static void render_system_box(struct mon_data *d, int box_top, int box_bot, int h, int col_w) {
     draw_box(box_top, 1, h, col_w, "SYSTEM");
     char buf[256];
     int r = box_top + 2;
@@ -836,12 +940,15 @@ void render(struct mon_data *d) {
         snprintf(buf, sizeof(buf), "%d program(s)", d->user_bin_count);
         print_val(r++, 3, col_w - 4, "User Binaries:", buf);
     }
+}
 
+static void render_thermal_power_box(struct mon_data *d, int box_top, int box_bot, int h, int col_w) {
     int c2x = col_w + 1;
     int c2w = col_w;
     int c2inner = c2w - 4;
     draw_box(box_top, c2x, h, c2w, "THERMAL & POWER");
-    r = box_top + 2;
+    char buf[256];
+    int r = box_top + 2;
     if (r < box_bot) draw_heading(r++, c2x + 2, c2inner, 36, "THERMAL");
     snprintf(buf, sizeof(buf), "%.1f °C", d->cpu_temp);
     if (r < box_bot) print_val(r++, c2x + 2, c2inner, "CPU Temp:", buf);
@@ -909,12 +1016,15 @@ void render(struct mon_data *d) {
         draw_heading(r++, c2x + 4, c2inner - 2, 0, l_buf);
         pp += n; while (*pp == ' ') pp++;
     }
+}
 
+static void render_network_disks_box(struct mon_data *d, int box_top, int box_bot, int h, int col_w) {
     int c3x = 2 * col_w + 1;
     int c3w = term_width - 2 * col_w;
     int c3inner = c3w - 4;
     draw_box(box_top, c3x, h, c3w, "NETWORK & DISKS");
-    r = box_top + 2;
+    char buf[256];
+    int r = box_top + 2;
 
     for (int i = 0; i < d->if_count && r < box_bot; i++) {
         char n_buf[64];
@@ -946,6 +1056,20 @@ void render(struct mon_data *d) {
             print_bar(r++, c3x + 2, c3inner, d->disks[i].usage, buf);
         }
     }
+}
+
+void render(struct mon_data *d) {
+    int col_w = term_width / 3 - 1; if (col_w < 30) col_w = 30;
+    int h = term_height - 6;
+    int box_top = 5;
+    int box_bot = box_top + h - 1;
+
+    move_cursor(2, (term_width - 24) / 2); printf("║ FreeBSD System Monitor ║");
+    move_cursor(3, (term_width - 24) / 2); printf("╚════════════════════════╝");
+
+    render_system_box(d, box_top, box_bot, h, col_w);
+    render_thermal_power_box(d, box_top, box_bot, h, col_w);
+    render_network_disks_box(d, box_top, box_bot, h, col_w);
 }
 
 int main() {
