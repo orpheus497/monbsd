@@ -73,9 +73,15 @@ static FILE *popen_safe(const char *path, char *const argv[], pid_t *pid_out) {
     return fp;
 }
 
-static void pclose_safe(FILE *fp, pid_t pid) {
+static int pclose_safe(FILE *fp, pid_t pid) {
+    int status = -1;
     if (fp) fclose(fp);
-    if (pid > 0) waitpid(pid, NULL, 0);
+    if (pid > 0) {
+        while (waitpid(pid, &status, 0) == -1) {
+            if (errno != EINTR) break;
+        }
+    }
+    return status;
 }
 
 struct gpu_data {
@@ -449,30 +455,36 @@ void gather_data(struct mon_data *d) {
         soft_ticks = 10;
         pid_t p_pid;
         char *pkg_info_argv[] = {"pkg", "info", "-q", NULL};
+        int count = 0;
         FILE *fp = popen_safe("/usr/local/sbin/pkg", pkg_info_argv, &p_pid);
         if (fp) {
-            d->pkg_count = 0;
             char buf[4096];
             size_t n;
             while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
                 for (size_t i = 0; i < n; i++) {
-                    if (buf[i] == '\n') d->pkg_count++;
+                    if (buf[i] == '\n') count++;
                 }
             }
-            pclose_safe(fp, p_pid);
+            int status = pclose_safe(fp, p_pid);
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                d->pkg_count = count;
+            }
         }
 
         char *pkg_query_argv[] = {"pkg", "query", "%r", NULL};
         fp = popen_safe("/usr/local/sbin/pkg", pkg_query_argv, &p_pid);
         if (fp) {
-            d->ports_count = 0;
+            count = 0;
             char line[1024];
             while (fgets(line, sizeof(line), fp)) {
                 if (strcasestr(line, "local")) {
-                    d->ports_count++;
+                    count++;
                 }
             }
-            pclose_safe(fp, p_pid);
+            int status = pclose_safe(fp, p_pid);
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                d->ports_count = count;
+            }
         }
         d->linux_count = 0;
         DIR *dir = opendir("/compat/linux/usr/bin");
@@ -581,6 +593,8 @@ void gather_data(struct mon_data *d) {
             char *pciconf_argv[] = {"pciconf", "-lv", NULL};
             FILE *fp = popen_safe("/usr/sbin/pciconf", pciconf_argv, &p_pid);
             if (fp) {
+                struct gpu_info_cache temp_cache[MAX_GPUS];
+                int temp_count = 0;
                 char line[1024];
                 int in_gpu = 0;
                 int pending_nvidia = 0;
@@ -599,31 +613,35 @@ void gather_data(struct mon_data *d) {
                         if (strstr(line, "NVIDIA") || strstr(line, "nvidia"))
                             pending_nvidia = 1;
                     }
-                    if (strstr(line, "device") && strstr(line, "=") && g_cached_count < MAX_GPUS) {
+                    if (strstr(line, "device") && strstr(line, "=") && temp_count < MAX_GPUS) {
                         char *start = strchr(line, '\'');
                         if (start) {
                             char *end = strchr(start + 1, '\'');
                             if (end) {
                                 *end = '\0';
-                                strlcpy(g_cache[g_cached_count].model, start + 1, sizeof(g_cache[g_cached_count].model));
-                                g_cache[g_cached_count].is_nvidia = pending_nvidia ||
-                                    (strstr(g_cache[g_cached_count].model, "NVIDIA") != NULL) ||
-                                    (strstr(g_cache[g_cached_count].model, "GeForce") != NULL) ||
-                                    (strstr(g_cache[g_cached_count].model, "Quadro") != NULL) ||
-                                    (strstr(g_cache[g_cached_count].model, "Tesla") != NULL);
-                                g_cached_count++;
+                                strlcpy(temp_cache[temp_count].model, start + 1, sizeof(temp_cache[temp_count].model));
+                                temp_cache[temp_count].is_nvidia = pending_nvidia ||
+                                    (strstr(temp_cache[temp_count].model, "NVIDIA") != NULL) ||
+                                    (strstr(temp_cache[temp_count].model, "GeForce") != NULL) ||
+                                    (strstr(temp_cache[temp_count].model, "Quadro") != NULL) ||
+                                    (strstr(temp_cache[temp_count].model, "Tesla") != NULL);
+                                temp_count++;
                                 in_gpu = 0;
                                 pending_nvidia = 0;
                             }
                         }
                     }
                 }
-                pclose_safe(fp, p_pid);
+                int status = pclose_safe(fp, p_pid);
+                if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                    memcpy(g_cache, temp_cache, sizeof(g_cache));
+                    g_cached_count = temp_count;
+                    if (has_nvidia_smi < 0) {
+                        has_nvidia_smi = (access(NVIDIA_SMI_PATH, X_OK) == 0) ? 1 : 0;
+                    }
+                    g_init = 1;
+                }
             }
-            if (has_nvidia_smi < 0) {
-                has_nvidia_smi = (access(NVIDIA_SMI_PATH, X_OK) == 0) ? 1 : 0;
-            }
-            g_init = 1;
         }
         d->gpu_count = g_cached_count;
 
@@ -640,28 +658,37 @@ void gather_data(struct mon_data *d) {
                 char *nvidia_argv[] = {"nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits", NULL};
                 FILE *fp = popen_safe(NVIDIA_SMI_PATH, nvidia_argv, &p_pid);
                 if (fp) {
+                    struct {
+                        float util;
+                        int used, total, temp;
+                    } res[MAX_GPUS];
+                    int res_count = 0;
                     char sbuf[1024];
-                    int nv_line = 0;
-                    while (fgets(sbuf, sizeof(sbuf), fp)) {
+                    while (fgets(sbuf, sizeof(sbuf), fp) && res_count < MAX_GPUS) {
                         float util; int mem_used, mem_total, gtemp;
                         if (sscanf(sbuf, " %f , %d , %d , %d", &util, &mem_used, &mem_total, &gtemp) == 4) {
-                            for (int i = 0; i < d->gpu_count; i++) {
-                                if (!g_cache[i].is_nvidia) continue;
-                                int nth = 0;
-                                for (int j = 0; j < i; j++)
-                                    if (g_cache[j].is_nvidia) nth++;
-                                if (nth == nv_line) {
-                                    d->gpus[i].util_pct = util;
-                                    d->gpus[i].vram_used_mib = mem_used;
-                                    d->gpus[i].vram_total_mib = mem_total;
-                                    d->gpus[i].temp_c = gtemp;
-                                    break;
-                                }
-                            }
-                            nv_line++;
+                            res[res_count].util = util;
+                            res[res_count].used = mem_used;
+                            res[res_count].total = mem_total;
+                            res[res_count].temp = gtemp;
+                            res_count++;
                         }
                     }
-                    pclose_safe(fp, p_pid);
+                    int status = pclose_safe(fp, p_pid);
+                    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                        for (int i = 0; i < d->gpu_count; i++) {
+                            if (!g_cache[i].is_nvidia) continue;
+                            int nth = 0;
+                            for (int j = 0; j < i; j++)
+                                if (g_cache[j].is_nvidia) nth++;
+                            if (nth < res_count) {
+                                d->gpus[i].util_pct = res[nth].util;
+                                d->gpus[i].vram_used_mib = res[nth].used;
+                                d->gpus[i].vram_total_mib = res[nth].total;
+                                d->gpus[i].temp_c = res[nth].temp;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -768,10 +795,12 @@ void gather_data(struct mon_data *d) {
                     }
                 }
             }
-            pclose_safe(fsw, swapinfo_pid);
-            cached_swap_total = total;
-            cached_swap_used = used;
-            swap_init = 1;
+            int status = pclose_safe(fsw, swapinfo_pid);
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                cached_swap_total = total;
+                cached_swap_used = used;
+                swap_init = 1;
+            }
         }
     }
     d->swap_total = cached_swap_total; d->swap_used = cached_swap_used;
