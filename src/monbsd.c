@@ -136,10 +136,8 @@ void clear_screen() { printf("\033[2J\033[H"); }
 static void draw_heading(int y, int x, int w, int color, const char *text) {
     if (y < 1 || w < 1) return;
     move_cursor(y, x);
-    printf("%*s", w, ""); // Clear the field width
-    move_cursor(y, x);
     if (color > 0) set_color(color);
-    printf("%.*s", w, text);
+    printf("%-*.*s", w, w, text);
     if (color > 0) reset_color();
 }
 
@@ -670,10 +668,10 @@ void gather_data(struct mon_data *d) {
             long long total = 0, used = 0;
             if (fgets(line, sizeof(line), fsw)) { // skip header
                 while (fgets(line, sizeof(line), fsw)) {
+                    if (strncasecmp(line, "Total", 5) == 0) continue;
                     char device[64];
                     long long t, u;
                     if (sscanf(line, "%63s %lld %lld", device, &t, &u) == 3) {
-                        if (strcasecmp(device, "Total") == 0) continue;
                         total += t * 1024;
                         used += u * 1024;
                     }
@@ -721,24 +719,21 @@ void draw_box(int y, int x, int h, int w, const char *title) {
 void print_val(int y, int x, int w, const char *lbl, const char *val) {
     if (w < 5 || y < 1) return;
     move_cursor(y, x);
-    printf("%*s", w, ""); // Clear the entire field width
-    move_cursor(y, x); set_color(37); 
+    set_color(37); 
     int lbl_len = strlen(lbl); if (lbl_len > w - 6) lbl_len = w - 6;
     printf("%.*s", lbl_len, lbl); reset_color();
-    int avail = w - lbl_len - 3;
+    int avail = w - lbl_len - 1;
     if (avail <= 0) return;
     int vlen = strlen(val);
-    if (vlen > avail) {
-        move_cursor(y, x + w - avail - 2); printf("%.*s..", avail - 2, val);
+    if (vlen > avail - 1) {
+        printf(" %*.*s..", avail - 3, avail - 3, val);
     } else {
-        move_cursor(y, x + w - vlen - 2); printf("%s", val);
+        printf("%*s ", avail, val);
     }
 }
 
 void print_bar(int y, int x, int w, double pct, const char *lbl) {
     if (w < 15 || y < 1) return;
-    move_cursor(y, x);
-    printf("%*s", w, ""); // Clear the entire field width
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     move_cursor(y, x); set_color(37); 
     int lbl_len = strlen(lbl); if (lbl_len > w / 2) lbl_len = w / 2;
