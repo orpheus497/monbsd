@@ -123,46 +123,6 @@ struct {
 } history[HISTORY_SIZE];
 int hist_idx = 0;
 
-static pid_t safe_exec_read(const char *path, char *const argv[], FILE **out_fp) {
-    int pfd[2];
-    if (pipe(pfd) < 0) return -1;
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pfd[0]);
-        close(pfd[1]);
-        return -1;
-    }
-
-    if (pid == 0) {
-        close(pfd[0]);
-        if (pfd[1] != STDOUT_FILENO) {
-            dup2(pfd[1], STDOUT_FILENO);
-            close(pfd[1]);
-        }
-        int fd_null = open("/dev/null", O_WRONLY);
-        if (fd_null >= 0) {
-            dup2(fd_null, STDERR_FILENO);
-            if (fd_null != STDERR_FILENO) close(fd_null);
-        }
-        char *const envp[] = {
-            "PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin",
-            NULL
-        };
-        execve(path, argv, envp);
-        _exit(127);
-    }
-
-    close(pfd[1]);
-    *out_fp = fdopen(pfd[0], "r");
-    if (!*out_fp) {
-        close(pfd[0]);
-        waitpid(pid, NULL, 0);
-        return -1;
-    }
-    return pid;
-}
-
 struct termios orig_termios;
 int term_width = 120, term_height = 40;
 volatile sig_atomic_t resize_pending = 0;
@@ -321,6 +281,32 @@ static int count_dir_executables(const char *path) {
     return count;
 }
 
+static FILE *popen_safe(const char *path, char *const argv[], pid_t *pid_out) {
+    int pipe_fds[2];
+    if (pipe(pipe_fds) == -1) return NULL;
+    pid_t pid = fork();
+    if (pid == -1) { close(pipe_fds[0]); close(pipe_fds[1]); return NULL; }
+    if (pid == 0) {
+        close(pipe_fds[0]);
+        dup2(pipe_fds[1], STDOUT_FILENO);
+        close(pipe_fds[1]);
+        int dev_null = open("/dev/null", O_WRONLY);
+        if (dev_null != -1) { dup2(dev_null, STDERR_FILENO); close(dev_null); }
+        execv(path, argv);
+        _exit(1);
+    }
+    close(pipe_fds[1]);
+    *pid_out = pid;
+    return fdopen(pipe_fds[0], "r");
+}
+
+static int pclose_safe(FILE *fp, pid_t pid) {
+    fclose(fp);
+    int status;
+    if (waitpid(pid, &status, 0) == -1) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
 void gather_data(struct mon_data *d) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
@@ -377,17 +363,37 @@ void gather_data(struct mon_data *d) {
     static int soft_ticks = 0;
     if (soft_ticks-- <= 0) {
         soft_ticks = 10;
-        FILE *fp = popen("/usr/local/sbin/pkg info -q 2>/dev/null | /usr/bin/wc -l", "r");
-        if (fp) { fscanf(fp, "%d", &d->pkg_count); pclose(fp); }
-        fp = popen("/usr/local/sbin/pkg query '%r' 2>/dev/null | /usr/bin/grep -ic 'local'", "r");
-        if (fp) { fscanf(fp, "%d", &d->ports_count); pclose(fp); }
+        pid_t p_pid;
+        char *pkg_info_argv[] = {"pkg", "info", "-q", NULL};
+        FILE *fp = popen_safe("/usr/local/sbin/pkg", pkg_info_argv, &p_pid);
+        if (fp) {
+            int count = 0;
+            char line[256];
+            while (fgets(line, sizeof(line), fp)) count++;
+            d->pkg_count = count;
+            pclose_safe(fp, p_pid);
+        }
+        char *pkg_query_argv[] = {"pkg", "query", "%r", NULL};
+        fp = popen_safe("/usr/local/sbin/pkg", pkg_query_argv, &p_pid);
+        if (fp) {
+            int count = 0;
+            char line[256];
+            while (fgets(line, sizeof(line), fp)) {
+                if (strstr(line, "local")) count++;
+            }
+            d->ports_count = count;
+            pclose_safe(fp, p_pid);
+        }
         d->linux_count = 0;
         DIR *dir = opendir("/compat/linux/usr/bin");
         if (dir) { struct dirent *e; while ((e = readdir(dir))) if (e->d_name[0] != '.') d->linux_count++; closedir(dir); }
 
         static int cached_pci_count = -1;
-        if (cached_pci_count == -1) {
-            cached_pci_count = direct_pci_count();
+        if (cached_pci_count == -1 || tick_count % 100 == 0) {
+            int current_count = direct_pci_count();
+            if (current_count >= 0) {
+                cached_pci_count = current_count;
+            }
         }
         d->pci_device_count = cached_pci_count;
 
@@ -477,7 +483,9 @@ void gather_data(struct mon_data *d) {
         static int has_nvidia_smi = -1;
 
         if (!g_init) {
-            FILE *fp = popen("/usr/sbin/pciconf -lv 2>/dev/null", "r");
+            pid_t p_pid;
+            char *pciconf_argv[] = {"pciconf", "-lv", NULL};
+            FILE *fp = popen_safe("/usr/sbin/pciconf", pciconf_argv, &p_pid);
             if (fp) {
                 char line[256];
                 int in_gpu = 0;
@@ -516,7 +524,7 @@ void gather_data(struct mon_data *d) {
                         }
                     }
                 }
-                pclose(fp);
+                pclose_safe(fp, p_pid);
             }
             if (has_nvidia_smi < 0) {
                 has_nvidia_smi = (access(NVIDIA_SMI_PATH, X_OK) == 0) ? 1 : 0;
@@ -534,15 +542,15 @@ void gather_data(struct mon_data *d) {
             }
 
             if (has_nvidia_smi) {
-                FILE *fp;
-                char *const nvsmi_argv[] = {
+                pid_t p_pid;
+                char *nvidia_argv[] = {
                     "nvidia-smi",
                     "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
                     "--format=csv,noheader,nounits",
                     NULL
                 };
-                pid_t pid = safe_exec_read(NVIDIA_SMI_PATH, nvsmi_argv, &fp);
-                if (pid > 0 && fp) {
+                FILE *fp = popen_safe(NVIDIA_SMI_PATH, nvidia_argv, &p_pid);
+                if (fp) {
                     char sbuf[256];
                     int nv_line = 0;
                     while (fgets(sbuf, sizeof(sbuf), fp)) {
@@ -564,8 +572,7 @@ void gather_data(struct mon_data *d) {
                             nv_line++;
                         }
                     }
-                    fclose(fp);
-                    waitpid(pid, NULL, 0);
+                    pclose_safe(fp, p_pid);
                 }
             }
 
@@ -655,12 +662,14 @@ void gather_data(struct mon_data *d) {
     static long long cached_swap_total = 0, cached_swap_used = 0;
     static int swap_init = 0;
     if (!swap_init || tick_count % 50 == 0) {
-        FILE *fsw = popen("/usr/sbin/swapinfo -k 2>/dev/null", "r");
+        pid_t swapinfo_pid;
+        char *swapinfo_argv[] = {"swapinfo", "-k", NULL};
+        FILE *fsw = popen_safe("/usr/sbin/swapinfo", swapinfo_argv, &swapinfo_pid);
         if (fsw) {
-            char line[256];
+            char line[1024];
             long long total = 0, used = 0;
-            if (fgets(line, 256, fsw)) { // skip header
-                while (fgets(line, 256, fsw)) {
+            if (fgets(line, sizeof(line), fsw)) { // skip header
+                while (fgets(line, sizeof(line), fsw)) {
                     char device[64];
                     long long t, u;
                     if (sscanf(line, "%63s %lld %lld", device, &t, &u) == 3) {
@@ -670,7 +679,7 @@ void gather_data(struct mon_data *d) {
                     }
                 }
             }
-            if (pclose(fsw) != -1) {
+            if (pclose_safe(fsw, swapinfo_pid) != -1) {
                 cached_swap_total = total;
                 cached_swap_used = used;
             }
