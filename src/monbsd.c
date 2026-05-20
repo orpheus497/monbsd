@@ -344,11 +344,9 @@ void gather_data(struct mon_data *d) {
         DIR *dir = opendir("/compat/linux/usr/bin");
         if (dir) { struct dirent *e; while ((e = readdir(dir))) if (e->d_name[0] != '.') d->linux_count++; closedir(dir); }
 
-        static int pci_count_cached = 0;
-        static int cached_pci_count = 0;
-        if (!pci_count_cached) {
+        static int cached_pci_count = -1;
+        if (cached_pci_count == -1) {
             cached_pci_count = direct_pci_count();
-            pci_count_cached = 1;
         }
         d->pci_device_count = cached_pci_count;
 
@@ -384,14 +382,13 @@ void gather_data(struct mon_data *d) {
     static int cached_powerdxx = 0;
 
     if (tick_count % 20 == 0) {
-        int mib[4];
+        int mib[3];
         size_t len;
         struct kinfo_proc *kp;
 
         mib[0] = CTL_KERN;
         mib[1] = KERN_PROC;
-        mib[2] = KERN_PROC_PROC;
-        mib[3] = 0;
+        mib[2] = KERN_PROC_ALL;
 
         if (sysctl(mib, 3, NULL, &len, NULL, 0) == 0) {
             len = len * 4 / 3; /* Allocate extra buffer to prevent race conditions */
