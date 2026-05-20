@@ -1,5 +1,4 @@
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,9 +26,8 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pwd.h>
-#include <sys/wait.h>
 #include <sys/user.h>
-#include <strings.h>
+#include <sys/wait.h>
 
 #define VERSION "0.1.0"
 #define HISTORY_SIZE 10
@@ -37,52 +35,6 @@
 #define MAX_NET_IF 4
 #define MAX_GPUS 2
 #define NVIDIA_SMI_PATH "/usr/local/bin/nvidia-smi"
-
-static FILE *popen_safe(const char *path, char *const argv[], pid_t *pid_out) {
-    int pipefd[2];
-    if (pipe(pipefd) < 0) return NULL;
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return NULL;
-    }
-    if (pid == 0) {
-        close(pipefd[0]);
-        if (pipefd[1] != STDOUT_FILENO) {
-            dup2(pipefd[1], STDOUT_FILENO);
-            close(pipefd[1]);
-        }
-        int devnull = open("/dev/null", O_RDWR);
-        if (devnull != -1) {
-            if (devnull != STDERR_FILENO) dup2(devnull, STDERR_FILENO);
-            if (devnull != STDERR_FILENO) close(devnull);
-        }
-        char *envp[] = {"PATH=/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin", NULL};
-        execve(path, argv, envp);
-        _exit(127);
-    }
-    close(pipefd[1]);
-    FILE *fp = fdopen(pipefd[0], "r");
-    if (!fp) {
-        close(pipefd[0]);
-        waitpid(pid, NULL, 0);
-        return NULL;
-    }
-    *pid_out = pid;
-    return fp;
-}
-
-static int pclose_safe(FILE *fp, pid_t pid) {
-    int status = -1;
-    if (fp) fclose(fp);
-    if (pid > 0) {
-        while (waitpid(pid, &status, 0) == -1) {
-            if (errno != EINTR) break;
-        }
-    }
-    return status;
-}
 
 struct gpu_data {
     char model[128];
@@ -153,9 +105,6 @@ struct mon_data {
     int disk_count;
     char home_path[MAXPATHLEN];
     char home_dir[MAXPATHLEN];
-
-    int user_bin_ticks;
-    int cached_user_bin_count;
 };
 
 struct iface_history {
@@ -187,10 +136,8 @@ void clear_screen() { printf("\033[2J\033[H"); }
 static void draw_heading(int y, int x, int w, int color, const char *text) {
     if (y < 1 || w < 1) return;
     move_cursor(y, x);
-    printf("%*s", w, ""); // Clear the field width
-    move_cursor(y, x);
     if (color > 0) set_color(color);
-    printf("%.*s", w, text);
+    printf("%-*.*s", w, w, text);
     if (color > 0) reset_color();
 }
 
@@ -332,69 +279,30 @@ static int count_dir_executables(const char *path) {
     return count;
 }
 
-static int run_pgrep(const char *proc_name, int use_q) {
+static FILE *popen_safe(const char *path, char *const argv[], pid_t *pid_out) {
+    int pipe_fds[2];
+    if (pipe(pipe_fds) == -1) return NULL;
     pid_t pid = fork();
-    if (pid == -1) return -1;
-
+    if (pid == -1) { close(pipe_fds[0]); close(pipe_fds[1]); return NULL; }
     if (pid == 0) {
-        /* Child process: redirect stdout/stderr to /dev/null */
-        int fd = open("/dev/null", O_WRONLY);
-        if (fd != -1) {
-            dup2(fd, STDOUT_FILENO);
-            dup2(fd, STDERR_FILENO);
-            if (fd > STDERR_FILENO) {
-                close(fd);
-            }
-        }
-
-        /* Construct a minimal clean environment */
-        char *envp[] = { "PATH=/bin:/usr/bin:/sbin:/usr/sbin", NULL };
-
-        if (use_q) {
-            char *argv[] = { "/usr/bin/pgrep", "-q", "-x", (char *)proc_name, NULL };
-            execve(argv[0], argv, envp);
-            argv[0] = "/bin/pgrep";
-            execve(argv[0], argv, envp);
-        } else {
-            char *argv[] = { "/usr/bin/pgrep", "-x", (char *)proc_name, NULL };
-            execve(argv[0], argv, envp);
-            argv[0] = "/bin/pgrep";
-            execve(argv[0], argv, envp);
-        }
-
-        _exit(127); /* Command not found or execution failed */
+        close(pipe_fds[0]);
+        dup2(pipe_fds[1], STDOUT_FILENO);
+        close(pipe_fds[1]);
+        int dev_null = open("/dev/null", O_WRONLY);
+        if (dev_null != -1) { dup2(dev_null, STDERR_FILENO); close(dev_null); }
+        execv(path, argv);
+        _exit(1);
     }
-
-    /* Parent process */
-    int status;
-    while (waitpid(pid, &status, 0) == -1) {
-        if (errno != EINTR) {
-            return -1;
-        }
-    }
-
-    if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
-    }
-    return -1;
+    close(pipe_fds[1]);
+    *pid_out = pid;
+    return fdopen(pipe_fds[0], "r");
 }
 
-static int check_process_running(const char *proc_name) {
-    int exit_code = run_pgrep(proc_name, 1); /* Try with -q first */
-
-    if (exit_code == 0) {
-        return 1; /* Process is running */
-    } else if (exit_code == 1) {
-        return 0; /* Process is not running (pgrep standard exit for no match) */
-    } else {
-        /*
-         * If exit_code > 1 (e.g., 2 or 3), it means pgrep syntax error
-         * which could happen if -q is not supported.
-         * Try again without -q.
-         */
-        exit_code = run_pgrep(proc_name, 0);
-        return (exit_code == 0) ? 1 : 0;
-    }
+static int pclose_safe(FILE *fp, pid_t pid) {
+    fclose(fp);
+    int status;
+    if (waitpid(pid, &status, 0) == -1) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 void gather_data(struct mon_data *d) {
@@ -455,40 +363,29 @@ void gather_data(struct mon_data *d) {
         soft_ticks = 10;
         pid_t p_pid;
         char *pkg_info_argv[] = {"pkg", "info", "-q", NULL};
-        int count = 0;
         FILE *fp = popen_safe("/usr/local/sbin/pkg", pkg_info_argv, &p_pid);
         if (fp) {
-            char buf[4096];
-            size_t n;
-            while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
-                for (size_t i = 0; i < n; i++) {
-                    if (buf[i] == '\n') count++;
-                }
-            }
-            int status = pclose_safe(fp, p_pid);
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                d->pkg_count = count;
-            }
+            int count = 0;
+            char line[256];
+            while (fgets(line, sizeof(line), fp)) count++;
+            d->pkg_count = count;
+            pclose_safe(fp, p_pid);
         }
-
         char *pkg_query_argv[] = {"pkg", "query", "%r", NULL};
         fp = popen_safe("/usr/local/sbin/pkg", pkg_query_argv, &p_pid);
         if (fp) {
-            count = 0;
-            char line[1024];
+            int count = 0;
+            char line[256];
             while (fgets(line, sizeof(line), fp)) {
-                if (strcasestr(line, "local")) {
-                    count++;
-                }
+                if (strstr(line, "local")) count++;
             }
-            int status = pclose_safe(fp, p_pid);
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                d->ports_count = count;
-            }
+            d->ports_count = count;
+            pclose_safe(fp, p_pid);
         }
         d->linux_count = 0;
         DIR *dir = opendir("/compat/linux/usr/bin");
         if (dir) { struct dirent *e; while ((e = readdir(dir))) if (e->d_name[0] != '.') d->linux_count++; closedir(dir); }
+
         static int cached_pci_count = -1;
         if (cached_pci_count == -1 || tick_count % 100 == 0) {
             int current_count = direct_pci_count();
@@ -497,22 +394,18 @@ void gather_data(struct mon_data *d) {
             }
         }
         d->pci_device_count = cached_pci_count;
-    }
 
-    if (d->user_bin_ticks-- <= 0) {
-        d->user_bin_ticks = 600;
-        d->cached_user_bin_count = 0;
+        d->user_bin_count = 0;
         if (d->home_dir[0]) {
             char probe[MAXPATHLEN];
             snprintf(probe, sizeof(probe), "%s/.local/bin", d->home_dir);
-            d->cached_user_bin_count += count_dir_executables(probe);
+            d->user_bin_count += count_dir_executables(probe);
             snprintf(probe, sizeof(probe), "%s/bin", d->home_dir);
-            d->cached_user_bin_count += count_dir_executables(probe);
+            d->user_bin_count += count_dir_executables(probe);
             snprintf(probe, sizeof(probe), "%s/local/bin", d->home_dir);
-            d->cached_user_bin_count += count_dir_executables(probe);
+            d->user_bin_count += count_dir_executables(probe);
         }
     }
-    d->user_bin_count = d->cached_user_bin_count;
 
     d->cpu_temp = direct_cpu_temp();
     
@@ -534,20 +427,19 @@ void gather_data(struct mon_data *d) {
     static int cached_powerdxx = 0;
 
     if (tick_count % 20 == 0) {
-        int mib[4];
+        int mib[3];
         size_t len;
         struct kinfo_proc *kp;
 
         mib[0] = CTL_KERN;
         mib[1] = KERN_PROC;
-        mib[2] = KERN_PROC_PROC;
-        mib[3] = 0;
+        mib[2] = KERN_PROC_ALL;
 
-        if (sysctl(mib, 4, NULL, &len, NULL, 0) == 0) {
+        if (sysctl(mib, 3, NULL, &len, NULL, 0) == 0) {
             len = len * 4 / 3; /* Allocate extra buffer to prevent race conditions */
             kp = malloc(len);
             if (kp != NULL) {
-                if (sysctl(mib, 4, kp, &len, NULL, 0) == 0) {
+                if (sysctl(mib, 3, kp, &len, NULL, 0) == 0) {
                     int found_powerd = 0;
                     int found_powerdxx = 0;
                     int nproc = len / sizeof(struct kinfo_proc);
@@ -593,9 +485,7 @@ void gather_data(struct mon_data *d) {
             char *pciconf_argv[] = {"pciconf", "-lv", NULL};
             FILE *fp = popen_safe("/usr/sbin/pciconf", pciconf_argv, &p_pid);
             if (fp) {
-                struct gpu_info_cache temp_cache[MAX_GPUS];
-                int temp_count = 0;
-                char line[1024];
+                char line[256];
                 int in_gpu = 0;
                 int pending_nvidia = 0;
                 while (fgets(line, sizeof(line), fp)) {
@@ -613,35 +503,31 @@ void gather_data(struct mon_data *d) {
                         if (strstr(line, "NVIDIA") || strstr(line, "nvidia"))
                             pending_nvidia = 1;
                     }
-                    if (strstr(line, "device") && strstr(line, "=") && temp_count < MAX_GPUS) {
+                    if (strstr(line, "device") && strstr(line, "=") && g_cached_count < MAX_GPUS) {
                         char *start = strchr(line, '\'');
                         if (start) {
                             char *end = strchr(start + 1, '\'');
                             if (end) {
                                 *end = '\0';
-                                strlcpy(temp_cache[temp_count].model, start + 1, sizeof(temp_cache[temp_count].model));
-                                temp_cache[temp_count].is_nvidia = pending_nvidia ||
-                                    (strstr(temp_cache[temp_count].model, "NVIDIA") != NULL) ||
-                                    (strstr(temp_cache[temp_count].model, "GeForce") != NULL) ||
-                                    (strstr(temp_cache[temp_count].model, "Quadro") != NULL) ||
-                                    (strstr(temp_cache[temp_count].model, "Tesla") != NULL);
-                                temp_count++;
+                                strlcpy(g_cache[g_cached_count].model, start + 1, sizeof(g_cache[g_cached_count].model));
+                                g_cache[g_cached_count].is_nvidia = pending_nvidia ||
+                                    (strstr(g_cache[g_cached_count].model, "NVIDIA") != NULL) ||
+                                    (strstr(g_cache[g_cached_count].model, "GeForce") != NULL) ||
+                                    (strstr(g_cache[g_cached_count].model, "Quadro") != NULL) ||
+                                    (strstr(g_cache[g_cached_count].model, "Tesla") != NULL);
+                                g_cached_count++;
                                 in_gpu = 0;
                                 pending_nvidia = 0;
                             }
                         }
                     }
                 }
-                int status = pclose_safe(fp, p_pid);
-                if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                    memcpy(g_cache, temp_cache, sizeof(g_cache));
-                    g_cached_count = temp_count;
-                    if (has_nvidia_smi < 0) {
-                        has_nvidia_smi = (access(NVIDIA_SMI_PATH, X_OK) == 0) ? 1 : 0;
-                    }
-                    g_init = 1;
-                }
+                pclose_safe(fp, p_pid);
             }
+            if (has_nvidia_smi < 0) {
+                has_nvidia_smi = (access(NVIDIA_SMI_PATH, X_OK) == 0) ? 1 : 0;
+            }
+            g_init = 1;
         }
         d->gpu_count = g_cached_count;
 
@@ -655,40 +541,36 @@ void gather_data(struct mon_data *d) {
 
             if (has_nvidia_smi) {
                 pid_t p_pid;
-                char *nvidia_argv[] = {"nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits", NULL};
+                char *nvidia_argv[] = {
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+                    "--format=csv,noheader,nounits",
+                    NULL
+                };
                 FILE *fp = popen_safe(NVIDIA_SMI_PATH, nvidia_argv, &p_pid);
                 if (fp) {
-                    struct {
-                        float util;
-                        int used, total, temp;
-                    } res[MAX_GPUS];
-                    int res_count = 0;
-                    char sbuf[1024];
-                    while (fgets(sbuf, sizeof(sbuf), fp) && res_count < MAX_GPUS) {
+                    char sbuf[256];
+                    int nv_line = 0;
+                    while (fgets(sbuf, sizeof(sbuf), fp)) {
                         float util; int mem_used, mem_total, gtemp;
                         if (sscanf(sbuf, " %f , %d , %d , %d", &util, &mem_used, &mem_total, &gtemp) == 4) {
-                            res[res_count].util = util;
-                            res[res_count].used = mem_used;
-                            res[res_count].total = mem_total;
-                            res[res_count].temp = gtemp;
-                            res_count++;
-                        }
-                    }
-                    int status = pclose_safe(fp, p_pid);
-                    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                        for (int i = 0; i < d->gpu_count; i++) {
-                            if (!g_cache[i].is_nvidia) continue;
-                            int nth = 0;
-                            for (int j = 0; j < i; j++)
-                                if (g_cache[j].is_nvidia) nth++;
-                            if (nth < res_count) {
-                                d->gpus[i].util_pct = res[nth].util;
-                                d->gpus[i].vram_used_mib = res[nth].used;
-                                d->gpus[i].vram_total_mib = res[nth].total;
-                                d->gpus[i].temp_c = res[nth].temp;
+                            for (int i = 0; i < d->gpu_count; i++) {
+                                if (!g_cache[i].is_nvidia) continue;
+                                int nth = 0;
+                                for (int j = 0; j < i; j++)
+                                    if (g_cache[j].is_nvidia) nth++;
+                                if (nth == nv_line) {
+                                    d->gpus[i].util_pct = util;
+                                    d->gpus[i].vram_used_mib = mem_used;
+                                    d->gpus[i].vram_total_mib = mem_total;
+                                    d->gpus[i].temp_c = gtemp;
+                                    break;
+                                }
                             }
+                            nv_line++;
                         }
                     }
+                    pclose_safe(fp, p_pid);
                 }
             }
 
@@ -786,24 +668,24 @@ void gather_data(struct mon_data *d) {
             long long total = 0, used = 0;
             if (fgets(line, sizeof(line), fsw)) { // skip header
                 while (fgets(line, sizeof(line), fsw)) {
+                    if (strncasecmp(line, "Total", 5) == 0) continue;
                     char device[64];
                     long long t, u;
                     if (sscanf(line, "%63s %lld %lld", device, &t, &u) == 3) {
-                        if (strcasecmp(device, "Total") == 0) continue;
-                        total += (long long)t * 1024;
-                        used += (long long)u * 1024;
+                        total += t * 1024;
+                        used += u * 1024;
                     }
                 }
             }
-            int status = pclose_safe(fsw, swapinfo_pid);
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            if (pclose_safe(fsw, swapinfo_pid) != -1) {
                 cached_swap_total = total;
                 cached_swap_used = used;
-                swap_init = 1;
             }
         }
+        swap_init = 1;
     }
     d->swap_total = cached_swap_total; d->swap_used = cached_swap_used;
+
     d->swap_usage = (d->swap_total > 0) ? (100.0 * d->swap_used / d->swap_total) : 0;
 
     int nfs = getfsstat(NULL, 0, MNT_NOWAIT);
@@ -837,24 +719,21 @@ void draw_box(int y, int x, int h, int w, const char *title) {
 void print_val(int y, int x, int w, const char *lbl, const char *val) {
     if (w < 5 || y < 1) return;
     move_cursor(y, x);
-    printf("%*s", w, ""); // Clear the entire field width
-    move_cursor(y, x); set_color(37); 
+    set_color(37); 
     int lbl_len = strlen(lbl); if (lbl_len > w - 6) lbl_len = w - 6;
     printf("%.*s", lbl_len, lbl); reset_color();
-    int avail = w - lbl_len - 3;
+    int avail = w - lbl_len - 1;
     if (avail <= 0) return;
     int vlen = strlen(val);
-    if (vlen > avail) {
-        move_cursor(y, x + w - avail - 2); printf("%.*s..", avail - 2, val);
+    if (vlen > avail - 1) {
+        printf(" %*.*s..", avail - 3, avail - 3, val);
     } else {
-        move_cursor(y, x + w - vlen - 2); printf("%s", val);
+        printf("%*s ", avail, val);
     }
 }
 
 void print_bar(int y, int x, int w, double pct, const char *lbl) {
     if (w < 15 || y < 1) return;
-    move_cursor(y, x);
-    printf("%*s", w, ""); // Clear the entire field width
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     move_cursor(y, x); set_color(37); 
     int lbl_len = strlen(lbl); if (lbl_len > w / 2) lbl_len = w / 2;
