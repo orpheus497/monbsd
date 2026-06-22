@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
@@ -961,7 +962,22 @@ int main() {
     }
 
     const char *term_env = getenv("TERM");
-    char *term = (term_env != NULL) ? strndup(term_env, 64) : NULL;
+    char *term = NULL;
+    if (term_env != NULL) {
+        int valid = 1;
+        for (int i = 0; term_env[i] != '\0' && i < 64; i++) {
+            char c = term_env[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) &&
+                c != '-' && c != '_' && c != '.' && c != '+') {
+                valid = 0;
+                break;
+            }
+        }
+        if (valid) {
+            term = strndup(term_env, 64);
+        }
+    }
+
     if (clearenv() != 0 ||
         setenv("PATH", "/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/sbin:/usr/local/bin", 1) != 0 ||
         (term != NULL && setenv("TERM", term, 1) != 0)) {
