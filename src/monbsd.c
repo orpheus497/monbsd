@@ -290,8 +290,10 @@ static FILE *popen_safe(const char *path, char *const argv[], pid_t *pid_out) {
         close(pipe_fds[1]);
         int dev_null = open("/dev/null", O_WRONLY);
         if (dev_null != -1) { dup2(dev_null, STDERR_FILENO); close(dev_null); }
-        if (setgid(getgid()) == -1) _exit(1);
-        if (setuid(getuid()) == -1) _exit(1);
+        gid_t rgid = getgid();
+        uid_t ruid = getuid();
+        if (setresgid(rgid, rgid, rgid) == -1) _exit(1);
+        if (setresuid(ruid, ruid, ruid) == -1) _exit(1);
         execv(path, argv);
         _exit(1);
     }
