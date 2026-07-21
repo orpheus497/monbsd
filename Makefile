@@ -13,7 +13,7 @@ TESTS= $(TEST_SRCS:.c=)
 all: ${TARGET}
 
 ${TARGET}: ${SRC}
-	${CC} ${CFLAGS} ${SRC} -o ${TARGET}
+	${CC} ${CFLAGS} ${SRC} -o ${TARGET} -pthread
 
 tests: ${TESTS}
 
