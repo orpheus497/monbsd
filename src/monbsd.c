@@ -311,9 +311,9 @@ static int pclose_safe(FILE *fp, pid_t pid) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-static volatile int g_pkg_count = 0;
-static volatile int g_ports_count = 0;
-static volatile int g_pkg_thread_running = 0;
+static int g_pkg_count = 0;
+static int g_ports_count = 0;
+static int g_pkg_thread_running = 0;
 
 static void *update_pkg_counts_thread(void *arg) {
     (void)arg;
@@ -324,7 +324,7 @@ static void *update_pkg_counts_thread(void *arg) {
         int count = 0;
         char line[256];
         while (fgets(line, sizeof(line), fp)) count++;
-        g_pkg_count = count;
+        __atomic_store_n(&g_pkg_count, count, __ATOMIC_RELAXED);
         pclose_safe(fp, p_pid);
     }
     char *pkg_query_argv[] = {"pkg", "query", "%r", NULL};
@@ -335,13 +335,12 @@ static void *update_pkg_counts_thread(void *arg) {
         while (fgets(line, sizeof(line), fp)) {
             if (strstr(line, "local")) count++;
         }
-        g_ports_count = count;
+        __atomic_store_n(&g_ports_count, count, __ATOMIC_RELAXED);
         pclose_safe(fp, p_pid);
     }
 
     // Ensure memory is visibly updated before clearing the flag
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    g_pkg_thread_running = 0;
+    __atomic_store_n(&g_pkg_thread_running, 0, __ATOMIC_RELEASE);
     return NULL;
 }
 
@@ -402,15 +401,14 @@ void gather_data(struct mon_data *d) {
     if (soft_ticks-- <= 0) {
         soft_ticks = 10;
 
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        if (!g_pkg_thread_running) {
-            g_pkg_thread_running = 1;
+        if (__atomic_load_n(&g_pkg_thread_running, __ATOMIC_ACQUIRE) == 0) {
+            __atomic_store_n(&g_pkg_thread_running, 1, __ATOMIC_RELEASE);
             pthread_t t;
             pthread_attr_t attr;
             pthread_attr_init(&attr);
             pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
             if (pthread_create(&t, &attr, update_pkg_counts_thread, NULL) != 0) {
-                g_pkg_thread_running = 0;
+                __atomic_store_n(&g_pkg_thread_running, 0, __ATOMIC_RELEASE);
             }
             pthread_attr_destroy(&attr);
         }
@@ -440,9 +438,8 @@ void gather_data(struct mon_data *d) {
         }
     }
 
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    d->pkg_count = g_pkg_count;
-    d->ports_count = g_ports_count;
+    d->pkg_count = __atomic_load_n(&g_pkg_count, __ATOMIC_RELAXED);
+    d->ports_count = __atomic_load_n(&g_ports_count, __ATOMIC_RELAXED);
 
     d->cpu_temp = direct_cpu_temp();
     
