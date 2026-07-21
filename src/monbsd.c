@@ -267,14 +267,22 @@ static int count_dir_executables(const char *path) {
     if (!dir) return 0;
     int count = 0;
     struct dirent *e;
-    char full[MAXPATHLEN];
+    int dfd = dirfd(dir);
     while ((e = readdir(dir))) {
         if (e->d_name[0] == '.') continue;
-        snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
-        if (access(full, X_OK) == 0) {
-            struct stat st;
-            if (stat(full, &st) == 0 && S_ISREG(st.st_mode))
+
+        if (e->d_type != DT_UNKNOWN && e->d_type != DT_REG && e->d_type != DT_LNK)
+            continue;
+
+        if (e->d_type == DT_REG) {
+            if (faccessat(dfd, e->d_name, X_OK, 0) == 0)
                 count++;
+        } else {
+            if (faccessat(dfd, e->d_name, X_OK, 0) == 0) {
+                struct stat st;
+                if (fstatat(dfd, e->d_name, &st, 0) == 0 && S_ISREG(st.st_mode))
+                    count++;
+            }
         }
     }
     closedir(dir);
