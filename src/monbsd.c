@@ -30,7 +30,6 @@
 #include <sys/user.h>
 #include <pthread.h>
 #include <sys/wait.h>
-#include <pthread.h>
 
 #define VERSION "0.1.0"
 #define HISTORY_SIZE 10
@@ -135,6 +134,7 @@ static int bg_pci_device_count = -1;
 static int bg_user_bin_count = 0;
 static char bg_home_dir[MAXPATHLEN] = {0};
 static int bg_data_ready = 0;
+
 
 struct termios orig_termios;
 int term_width = 120, term_height = 40;
@@ -458,7 +458,6 @@ void gather_data(struct mon_data *d) {
         d->user_bin_count = bg_user_bin_count;
     }
     pthread_mutex_unlock(&bg_cache_mutex);
-
 
     d->cpu_temp = direct_cpu_temp();
     
