@@ -1,5 +1,5 @@
 CC?= cc
-CFLAGS+= -Wall -Wextra -O2
+CFLAGS+= -Wall -Wextra -O2 -pthread
 PREFIX?= /usr/local
 BINDIR= ${PREFIX}/bin
 MANDIR= ${PREFIX}/man/man8
