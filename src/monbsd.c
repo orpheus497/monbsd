@@ -1033,7 +1033,11 @@ int main() {
     pthread_mutex_unlock(&bg_cache_mutex);
 
     pthread_t bg_thread;
-    pthread_create(&bg_thread, NULL, background_update_thread, NULL);
+    int rc = pthread_create(&bg_thread, NULL, background_update_thread, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "Failed to create background update thread: %s\n", strerror(rc));
+        exit(1);
+    }
     pthread_detach(bg_thread);
 
     enable_raw_mode();
