@@ -125,17 +125,6 @@ struct {
 } history[HISTORY_SIZE];
 int hist_idx = 0;
 
-/* Cached data from background thread */
-static pthread_mutex_t bg_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int bg_pkg_count = 0;
-static int bg_ports_count = 0;
-static int bg_linux_count = 0;
-static int bg_pci_device_count = -1;
-static int bg_user_bin_count = 0;
-static char bg_home_dir[MAXPATHLEN] = {0};
-static int bg_data_ready = 0;
-
-
 struct termios orig_termios;
 int term_width = 120, term_height = 40;
 volatile sig_atomic_t resize_pending = 0;
@@ -330,69 +319,36 @@ static int pclose_safe(FILE *fp, pid_t pid) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-void *background_update_thread(void *arg) {
+static int g_pkg_count = 0;
+static int g_ports_count = 0;
+static int g_pkg_thread_running = 0;
+
+static void *update_pkg_counts_thread(void *arg) {
     (void)arg;
-    while (1) {
-        int pkg_count = 0;
-        int ports_count = 0;
-        int linux_count = 0;
-        int user_bin_count = 0;
-        int pci_device_count = -1;
-
-        pid_t p_pid;
-        char *pkg_info_argv[] = {"pkg", "info", "-q", NULL};
-        FILE *fp = popen_safe("/usr/local/sbin/pkg", pkg_info_argv, &p_pid);
-        if (fp) {
-            char line[256];
-            while (fgets(line, sizeof(line), fp)) pkg_count++;
-            pclose_safe(fp, p_pid);
-        }
-
-        char *pkg_query_argv[] = {"pkg", "query", "%r", NULL};
-        fp = popen_safe("/usr/local/sbin/pkg", pkg_query_argv, &p_pid);
-        if (fp) {
-            char line[256];
-            while (fgets(line, sizeof(line), fp)) {
-                if (strstr(line, "local")) ports_count++;
-            }
-            pclose_safe(fp, p_pid);
-        }
-
-        DIR *dir = opendir("/compat/linux/usr/bin");
-        if (dir) {
-            struct dirent *e;
-            while ((e = readdir(dir))) if (e->d_name[0] != '.') linux_count++;
-            closedir(dir);
-        }
-
-        pci_device_count = direct_pci_count();
-
-        pthread_mutex_lock(&bg_cache_mutex);
-        char home_dir[MAXPATHLEN];
-        strlcpy(home_dir, bg_home_dir, sizeof(home_dir));
-        pthread_mutex_unlock(&bg_cache_mutex);
-
-        if (home_dir[0]) {
-            char probe[MAXPATHLEN];
-            snprintf(probe, sizeof(probe), "%s/.local/bin", home_dir);
-            user_bin_count += count_dir_executables(probe);
-            snprintf(probe, sizeof(probe), "%s/bin", home_dir);
-            user_bin_count += count_dir_executables(probe);
-            snprintf(probe, sizeof(probe), "%s/local/bin", home_dir);
-            user_bin_count += count_dir_executables(probe);
-        }
-
-        pthread_mutex_lock(&bg_cache_mutex);
-        bg_pkg_count = pkg_count;
-        bg_ports_count = ports_count;
-        bg_linux_count = linux_count;
-        if (pci_device_count >= 0) bg_pci_device_count = pci_device_count;
-        bg_user_bin_count = user_bin_count;
-        bg_data_ready = 1;
-        pthread_mutex_unlock(&bg_cache_mutex);
-
-        sleep(2);
+    pid_t p_pid;
+    char *pkg_info_argv[] = {"pkg", "info", "-q", NULL};
+    FILE *fp = popen_safe("/usr/local/sbin/pkg", pkg_info_argv, &p_pid);
+    if (fp) {
+        int count = 0;
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) count++;
+        __atomic_store_n(&g_pkg_count, count, __ATOMIC_RELAXED);
+        pclose_safe(fp, p_pid);
     }
+    char *pkg_query_argv[] = {"pkg", "query", "%r", NULL};
+    fp = popen_safe("/usr/local/sbin/pkg", pkg_query_argv, &p_pid);
+    if (fp) {
+        int count = 0;
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, "local")) count++;
+        }
+        __atomic_store_n(&g_ports_count, count, __ATOMIC_RELAXED);
+        pclose_safe(fp, p_pid);
+    }
+
+    // Ensure memory is visibly updated before clearing the flag
+    __atomic_store_n(&g_pkg_thread_running, 0, __ATOMIC_RELEASE);
     return NULL;
 }
 
@@ -449,15 +405,49 @@ void gather_data(struct mon_data *d) {
     d->mem_used = (long long)(active + wire) * pagesize;
     d->mem_usage = 100.0 * d->mem_used / d->mem_total;
 
-    pthread_mutex_lock(&bg_cache_mutex);
-    if (bg_data_ready) {
-        d->pkg_count = bg_pkg_count;
-        d->ports_count = bg_ports_count;
-        d->linux_count = bg_linux_count;
-        d->pci_device_count = bg_pci_device_count;
-        d->user_bin_count = bg_user_bin_count;
+    static int soft_ticks = 0;
+    if (soft_ticks-- <= 0) {
+        soft_ticks = 10;
+
+        if (__atomic_load_n(&g_pkg_thread_running, __ATOMIC_ACQUIRE) == 0) {
+            __atomic_store_n(&g_pkg_thread_running, 1, __ATOMIC_RELEASE);
+            pthread_t t;
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            if (pthread_create(&t, &attr, update_pkg_counts_thread, NULL) != 0) {
+                __atomic_store_n(&g_pkg_thread_running, 0, __ATOMIC_RELEASE);
+            }
+            pthread_attr_destroy(&attr);
+        }
+
+        d->linux_count = 0;
+        DIR *dir = opendir("/compat/linux/usr/bin");
+        if (dir) { struct dirent *e; while ((e = readdir(dir))) if (e->d_name[0] != '.') d->linux_count++; closedir(dir); }
+
+        static int cached_pci_count = -1;
+        if (cached_pci_count == -1 || tick_count % 100 == 0) {
+            int current_count = direct_pci_count();
+            if (current_count >= 0) {
+                cached_pci_count = current_count;
+            }
+        }
+        d->pci_device_count = cached_pci_count;
+
+        d->user_bin_count = 0;
+        if (d->home_dir[0]) {
+            char probe[MAXPATHLEN];
+            snprintf(probe, sizeof(probe), "%s/.local/bin", d->home_dir);
+            d->user_bin_count += count_dir_executables(probe);
+            snprintf(probe, sizeof(probe), "%s/bin", d->home_dir);
+            d->user_bin_count += count_dir_executables(probe);
+            snprintf(probe, sizeof(probe), "%s/local/bin", d->home_dir);
+            d->user_bin_count += count_dir_executables(probe);
+        }
     }
-    pthread_mutex_unlock(&bg_cache_mutex);
+
+    d->pkg_count = __atomic_load_n(&g_pkg_count, __ATOMIC_RELAXED);
+    d->ports_count = __atomic_load_n(&g_ports_count, __ATOMIC_RELAXED);
 
     d->cpu_temp = direct_cpu_temp();
     
@@ -1036,19 +1026,6 @@ int main() {
     struct mon_data d = {0};
     strlcpy(d.home_path, resolved_home, sizeof(d.home_path));
     strlcpy(d.home_dir, resolved_home_dir, sizeof(d.home_dir));
-
-    pthread_mutex_lock(&bg_cache_mutex);
-    strlcpy(bg_home_dir, resolved_home_dir, sizeof(bg_home_dir));
-    pthread_mutex_unlock(&bg_cache_mutex);
-
-    pthread_t bg_thread;
-    int rc = pthread_create(&bg_thread, NULL, background_update_thread, NULL);
-    if (rc != 0) {
-        fprintf(stderr, "Failed to create background update thread: %s\n", strerror(rc));
-        exit(1);
-    }
-    pthread_detach(bg_thread);
-
     enable_raw_mode();
     signal(SIGWINCH, handle_sigwinch);
     get_terminal_size();
