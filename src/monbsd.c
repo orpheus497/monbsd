@@ -269,11 +269,21 @@ static int count_dir_executables(const char *path) {
     char full[MAXPATHLEN];
     while ((e = readdir(dir))) {
         if (e->d_name[0] == '.') continue;
+
+        if (e->d_type != DT_UNKNOWN && e->d_type != DT_REG && e->d_type != DT_LNK)
+            continue;
+
         snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
-        if (access(full, X_OK) == 0) {
-            struct stat st;
-            if (stat(full, &st) == 0 && S_ISREG(st.st_mode))
+
+        if (e->d_type == DT_REG) {
+            if (access(full, X_OK) == 0)
                 count++;
+        } else {
+            if (access(full, X_OK) == 0) {
+                struct stat st;
+                if (stat(full, &st) == 0 && S_ISREG(st.st_mode))
+                    count++;
+            }
         }
     }
     closedir(dir);
