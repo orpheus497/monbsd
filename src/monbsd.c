@@ -280,7 +280,7 @@ static int count_dir_executables(const char *path) {
     return count;
 }
 
-static FILE *execve_safe(const char *path, char *const argv[], pid_t *pid_out) {
+static FILE *popen_safe(const char *path, char *const argv[], pid_t *pid_out) {
     int pipe_fds[2];
     if (pipe(pipe_fds) == -1) return NULL;
     pid_t pid = fork();
@@ -307,7 +307,7 @@ static FILE *execve_safe(const char *path, char *const argv[], pid_t *pid_out) {
     return fdopen(pipe_fds[0], "r");
 }
 
-static int pclose_execve_safe(FILE *fp, pid_t pid) {
+static int pclose_safe(FILE *fp, pid_t pid) {
     fclose(fp);
     int status;
     if (waitpid(pid, &status, 0) == -1) return -1;
@@ -372,16 +372,16 @@ void gather_data(struct mon_data *d) {
         soft_ticks = 10;
         pid_t p_pid;
         char *pkg_info_argv[] = {"pkg", "info", "-q", NULL};
-        FILE *fp = execve_safe("/usr/local/sbin/pkg", pkg_info_argv, &p_pid);
+        FILE *fp = popen_safe("/usr/local/sbin/pkg", pkg_info_argv, &p_pid);
         if (fp) {
             int count = 0;
             char line[256];
             while (fgets(line, sizeof(line), fp)) count++;
             d->pkg_count = count;
-            pclose_execve_safe(fp, p_pid);
+            pclose_safe(fp, p_pid);
         }
         char *pkg_query_argv[] = {"pkg", "query", "%r", NULL};
-        fp = execve_safe("/usr/local/sbin/pkg", pkg_query_argv, &p_pid);
+        fp = popen_safe("/usr/local/sbin/pkg", pkg_query_argv, &p_pid);
         if (fp) {
             int count = 0;
             char line[256];
@@ -389,7 +389,7 @@ void gather_data(struct mon_data *d) {
                 if (strstr(line, "local")) count++;
             }
             d->ports_count = count;
-            pclose_execve_safe(fp, p_pid);
+            pclose_safe(fp, p_pid);
         }
         d->linux_count = 0;
         DIR *dir = opendir("/compat/linux/usr/bin");
@@ -492,7 +492,7 @@ void gather_data(struct mon_data *d) {
         if (!g_init) {
             pid_t p_pid;
             char *pciconf_argv[] = {"pciconf", "-lv", NULL};
-            FILE *fp = execve_safe("/usr/sbin/pciconf", pciconf_argv, &p_pid);
+            FILE *fp = popen_safe("/usr/sbin/pciconf", pciconf_argv, &p_pid);
             if (fp) {
                 char line[256];
                 int in_gpu = 0;
@@ -531,7 +531,7 @@ void gather_data(struct mon_data *d) {
                         }
                     }
                 }
-                pclose_execve_safe(fp, p_pid);
+                pclose_safe(fp, p_pid);
             }
             if (has_nvidia_smi < 0) {
                 has_nvidia_smi = (access(NVIDIA_SMI_PATH, X_OK) == 0) ? 1 : 0;
@@ -556,7 +556,7 @@ void gather_data(struct mon_data *d) {
                     "--format=csv,noheader,nounits",
                     NULL
                 };
-                FILE *fp = execve_safe(NVIDIA_SMI_PATH, nvidia_argv, &p_pid);
+                FILE *fp = popen_safe(NVIDIA_SMI_PATH, nvidia_argv, &p_pid);
                 if (fp) {
                     char sbuf[256];
                     int nv_line = 0;
@@ -579,7 +579,7 @@ void gather_data(struct mon_data *d) {
                             nv_line++;
                         }
                     }
-                    pclose_execve_safe(fp, p_pid);
+                    pclose_safe(fp, p_pid);
                 }
             }
 
@@ -671,7 +671,7 @@ void gather_data(struct mon_data *d) {
     if (!swap_init || tick_count % 50 == 0) {
         pid_t swapinfo_pid;
         char *swapinfo_argv[] = {"swapinfo", "-k", NULL};
-        FILE *fsw = execve_safe("/usr/sbin/swapinfo", swapinfo_argv, &swapinfo_pid);
+        FILE *fsw = popen_safe("/usr/sbin/swapinfo", swapinfo_argv, &swapinfo_pid);
         if (fsw) {
             char line[1024];
             long long total = 0, used = 0;
@@ -686,7 +686,7 @@ void gather_data(struct mon_data *d) {
                     }
                 }
             }
-            if (pclose_execve_safe(fsw, swapinfo_pid) != -1) {
+            if (pclose_safe(fsw, swapinfo_pid) != -1) {
                 cached_swap_total = total;
                 cached_swap_used = used;
             }
