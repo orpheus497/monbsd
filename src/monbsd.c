@@ -263,8 +263,17 @@ int direct_pci_count() {
 }
 
 static int count_dir_executables(const char *path) {
+    uid_t orig_euid = geteuid();
+    uid_t ruid = getuid();
+
+    if (seteuid(ruid) != 0)
+        return 0;
+
     DIR *dir = opendir(path);
-    if (!dir) return 0;
+    if (!dir) {
+        if (seteuid(orig_euid) != 0) exit(1);
+        return 0;
+    }
     int count = 0;
     struct dirent *e;
     int dfd = dirfd(dir);
@@ -286,6 +295,9 @@ static int count_dir_executables(const char *path) {
         }
     }
     closedir(dir);
+
+    if (seteuid(orig_euid) != 0) exit(1);
+
     return count;
 }
 
