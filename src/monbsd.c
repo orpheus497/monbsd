@@ -405,9 +405,9 @@ void gather_data(struct mon_data *d) {
     d->mem_used = (long long)(active + wire) * pagesize;
     d->mem_usage = 100.0 * d->mem_used / d->mem_total;
 
-    static int soft_ticks = 0;
-    if (soft_ticks-- <= 0) {
-        soft_ticks = 10;
+    static int pkg_ticks = 0;
+    if (pkg_ticks-- <= 0) {
+        pkg_ticks = 3000;
 
         if (__atomic_load_n(&g_pkg_thread_running, __ATOMIC_ACQUIRE) == 0) {
             __atomic_store_n(&g_pkg_thread_running, 1, __ATOMIC_RELEASE);
@@ -420,6 +420,11 @@ void gather_data(struct mon_data *d) {
             }
             pthread_attr_destroy(&attr);
         }
+    }
+
+    static int soft_ticks = 0;
+    if (soft_ticks-- <= 0) {
+        soft_ticks = 10;
 
         d->linux_count = 0;
         DIR *dir = opendir("/compat/linux/usr/bin");
