@@ -730,24 +730,28 @@ void gather_data(struct mon_data *d) {
 
     d->swap_usage = (d->swap_total > 0) ? (100.0 * d->swap_used / d->swap_total) : 0;
 
-    int nfs = getfsstat(NULL, 0, MNT_NOWAIT);
-    struct statfs *fs = malloc(sizeof(struct statfs) * nfs);
-    nfs = getfsstat(fs, sizeof(struct statfs) * nfs, MNT_NOWAIT);
     d->disk_count = 0;
-    const char *targets[] = {"/", "/boot/efi", "/tmp", "/zroot", d->home_path};
-    for (int j = 0; j < 5; j++) {
-        if (targets[j][0] == '\0') continue;
-        for (int i = 0; i < nfs && d->disk_count < MAX_DISKS; i++) {
-            if (strcmp(fs[i].f_mntonname, targets[j]) == 0) {
-                strlcpy(d->disks[d->disk_count].mount, fs[i].f_mntonname, sizeof(d->disks[d->disk_count].mount));
-                d->disks[d->disk_count].total_bytes = (long long)fs[i].f_blocks * fs[i].f_bsize;
-                d->disks[d->disk_count].used_bytes = (long long)(fs[i].f_blocks - fs[i].f_bfree) * fs[i].f_bsize;
-                d->disks[d->disk_count].usage = 100.0 * d->disks[d->disk_count].used_bytes / d->disks[d->disk_count].total_bytes;
-                d->disk_count++; break;
+    int nfs = getfsstat(NULL, 0, MNT_NOWAIT);
+    if (nfs > 0) {
+        struct statfs *fs = malloc(sizeof(struct statfs) * nfs);
+        if (fs != NULL) {
+            nfs = getfsstat(fs, sizeof(struct statfs) * nfs, MNT_NOWAIT);
+            const char *targets[] = {"/", "/boot/efi", "/tmp", "/zroot", d->home_path};
+            for (int j = 0; j < 5; j++) {
+                if (targets[j][0] == '\0') continue;
+                for (int i = 0; i < nfs && d->disk_count < MAX_DISKS; i++) {
+                    if (strcmp(fs[i].f_mntonname, targets[j]) == 0) {
+                        strlcpy(d->disks[d->disk_count].mount, fs[i].f_mntonname, sizeof(d->disks[d->disk_count].mount));
+                        d->disks[d->disk_count].total_bytes = (long long)fs[i].f_blocks * fs[i].f_bsize;
+                        d->disks[d->disk_count].used_bytes = (long long)(fs[i].f_blocks - fs[i].f_bfree) * fs[i].f_bsize;
+                        d->disks[d->disk_count].usage = 100.0 * d->disks[d->disk_count].used_bytes / d->disks[d->disk_count].total_bytes;
+                        d->disk_count++; break;
+                    }
+                }
             }
+            free(fs);
         }
     }
-    free(fs);
 }
 
 void draw_box(int y, int x, int h, int w, const char *title) {
