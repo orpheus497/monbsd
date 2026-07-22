@@ -185,10 +185,14 @@ static void get_ip_address(const char *ifname, char *ip_buf, size_t buf_size) {
 }
 
 int direct_cpu_cores() {
+    static int cached_cores = 0;
+    if (cached_cores > 0) return cached_cores;
+
     u_int regs[4];
     do_cpuid(1, regs);
     int cores = (regs[1] >> 16) & 0xFF;
-    return cores > 0 ? cores : 1;
+    cached_cores = cores > 0 ? cores : 1;
+    return cached_cores;
 }
 
 double direct_cpu_temp() {
