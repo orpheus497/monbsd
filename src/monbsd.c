@@ -644,9 +644,9 @@ void gather_data(struct mon_data *d) {
     }
 
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    long cp_time[CPUSTATES]; size = sizeof(cp_time); sysctlbyname("kern.cp_time", cp_time, &size, NULL, 0);
+    long cp_time[CPUSTATES] = {0}; size = sizeof(cp_time); sysctlbyname("kern.cp_time", cp_time, &size, NULL, 0);
     
-    int ifc; size = sizeof(ifc); sysctlbyname("net.link.generic.system.ifcount", &ifc, &size, NULL, 0);
+    int ifc = 0; size = sizeof(ifc); sysctlbyname("net.link.generic.system.ifcount", &ifc, &size, NULL, 0);
     d->if_count = 0;
     for (int i = 1; i <= ifc && d->if_count < MAX_NET_IF; i++) {
         int mib[6] = {CTL_NET, PF_LINK, NETLINK_GENERIC, IFMIB_IFDATA, i, IFDATA_GENERAL};
