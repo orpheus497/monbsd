@@ -434,16 +434,21 @@ void gather_data(struct mon_data *d) {
         }
         d->pci_device_count = cached_pci_count;
 
-        d->user_bin_count = 0;
-        if (d->home_dir[0]) {
-            char probe[MAXPATHLEN];
-            snprintf(probe, sizeof(probe), "%s/.local/bin", d->home_dir);
-            d->user_bin_count += count_dir_executables(probe);
-            snprintf(probe, sizeof(probe), "%s/bin", d->home_dir);
-            d->user_bin_count += count_dir_executables(probe);
-            snprintf(probe, sizeof(probe), "%s/local/bin", d->home_dir);
-            d->user_bin_count += count_dir_executables(probe);
+        static int cached_user_bin_count = -1;
+        if (cached_user_bin_count == -1 || tick_count % 100 == 0) {
+            int current_user_bin_count = 0;
+            if (d->home_dir[0]) {
+                char probe[MAXPATHLEN];
+                snprintf(probe, sizeof(probe), "%s/.local/bin", d->home_dir);
+                current_user_bin_count += count_dir_executables(probe);
+                snprintf(probe, sizeof(probe), "%s/bin", d->home_dir);
+                current_user_bin_count += count_dir_executables(probe);
+                snprintf(probe, sizeof(probe), "%s/local/bin", d->home_dir);
+                current_user_bin_count += count_dir_executables(probe);
+            }
+            cached_user_bin_count = current_user_bin_count;
         }
+        d->user_bin_count = cached_user_bin_count;
     }
 
     d->pkg_count = __atomic_load_n(&g_pkg_count, __ATOMIC_RELAXED);
