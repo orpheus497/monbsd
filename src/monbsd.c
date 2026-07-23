@@ -170,10 +170,10 @@ void enable_raw_mode() {
     printf("\033[?25l");
 }
 
-static void get_ip_address(const char *ifname, char *ip_buf, size_t buf_size) {
-    struct ifaddrs *ifaddr, *ifa;
+static void get_ip_address(struct ifaddrs *ifaddr, const char *ifname, char *ip_buf, size_t buf_size) {
+    struct ifaddrs *ifa;
     strlcpy(ip_buf, "Unknown", buf_size);
-    if (getifaddrs(&ifaddr) == -1) return;
+    if (ifaddr == NULL) return;
     for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == NULL) continue;
         if (ifa->ifa_addr->sa_family == AF_INET && strcmp(ifa->ifa_name, ifname) == 0) {
@@ -181,7 +181,6 @@ static void get_ip_address(const char *ifname, char *ip_buf, size_t buf_size) {
             break;
         }
     }
-    freeifaddrs(ifaddr);
 }
 
 int direct_cpu_cores() {
@@ -669,6 +668,12 @@ void gather_data(struct mon_data *d) {
     
     int ifc = 0; size = sizeof(ifc); sysctlbyname("net.link.generic.system.ifcount", &ifc, &size, NULL, 0);
     d->if_count = 0;
+
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) == -1) {
+        ifaddr = NULL; // Ensure it's NULL if it fails, although getifaddrs usually doesn't touch it on failure
+    }
+
     for (int i = 1; i <= ifc && d->if_count < MAX_NET_IF; i++) {
         int mib[6] = {CTL_NET, PF_LINK, NETLINK_GENERIC, IFMIB_IFDATA, i, IFDATA_GENERAL};
         struct ifmibdata ifmd; size = sizeof(ifmd);
@@ -676,7 +681,7 @@ void gather_data(struct mon_data *d) {
             if (strcmp(ifmd.ifmd_name, "lo0") == 0) continue;
             if (ifmd.ifmd_data.ifi_link_state != LINK_STATE_UP) continue;
             char ip_buf[INET_ADDRSTRLEN];
-            get_ip_address(ifmd.ifmd_name, ip_buf, sizeof(ip_buf));
+            get_ip_address(ifaddr, ifmd.ifmd_name, ip_buf, sizeof(ip_buf));
             if (strcmp(ip_buf, "Unknown") == 0) continue;
             strlcpy(d->ifaces[d->if_count].name, ifmd.ifmd_name, sizeof(d->ifaces[d->if_count].name));
             strlcpy(d->ifaces[d->if_count].ip, ip_buf, sizeof(d->ifaces[d->if_count].ip));
@@ -700,6 +705,10 @@ void gather_data(struct mon_data *d) {
             }
             d->if_count++;
         }
+    }
+
+    if (ifaddr != NULL) {
+        freeifaddrs(ifaddr);
     }
 
     int oidx = (hist_idx + 1) % HISTORY_SIZE;
