@@ -413,10 +413,10 @@ void gather_data(struct mon_data *d) {
     d->cpu_cores = direct_cpu_cores();
 
     size = sizeof(d->mem_total); sysctlbyname("hw.physmem", &d->mem_total, &size, NULL, 0);
-    unsigned int active, wire, v_free; int pagesize; size = sizeof(pagesize); sysctlbyname("hw.pagesize", &pagesize, &size, NULL, 0);
+    unsigned int active = 0, wire = 0, v_free = 0; int pagesize = 0; size = sizeof(pagesize); sysctlbyname("hw.pagesize", &pagesize, &size, NULL, 0);
     size = sizeof(active); sysctlbyname("vm.stats.vm.v_active_count", &active, &size, NULL, 0);
-    sysctlbyname("vm.stats.vm.v_wire_count", &wire, &size, NULL, 0);
-    sysctlbyname("vm.stats.vm.v_free_count", &v_free, &size, NULL, 0);
+    size = sizeof(wire); sysctlbyname("vm.stats.vm.v_wire_count", &wire, &size, NULL, 0);
+    size = sizeof(v_free); sysctlbyname("vm.stats.vm.v_free_count", &v_free, &size, NULL, 0);
     d->mem_used = (long long)(active + wire) * pagesize;
     d->mem_usage = 100.0 * d->mem_used / d->mem_total;
 
