@@ -427,8 +427,19 @@ void gather_data(struct mon_data *d) {
     
     d->cpu_cores = direct_cpu_cores();
 
-    size = sizeof(d->mem_total); sysctlbyname("hw.physmem", &d->mem_total, &size, NULL, 0);
-    unsigned int active = 0, wire = 0, v_free = 0; int pagesize = 0; size = sizeof(pagesize); sysctlbyname("hw.pagesize", &pagesize, &size, NULL, 0);
+    static int hw_initialized = 0;
+    static long long cached_mem_total = 0;
+    static int cached_pagesize = 0;
+
+    if (!hw_initialized) {
+        size = sizeof(cached_mem_total); sysctlbyname("hw.physmem", &cached_mem_total, &size, NULL, 0);
+        size = sizeof(cached_pagesize); sysctlbyname("hw.pagesize", &cached_pagesize, &size, NULL, 0);
+        hw_initialized = 1;
+    }
+
+    d->mem_total = cached_mem_total;
+    unsigned int active = 0, wire = 0, v_free = 0;
+    int pagesize = cached_pagesize;
     size = sizeof(active); sysctlbyname("vm.stats.vm.v_active_count", &active, &size, NULL, 0);
     size = sizeof(wire); sysctlbyname("vm.stats.vm.v_wire_count", &wire, &size, NULL, 0);
     size = sizeof(v_free); sysctlbyname("vm.stats.vm.v_free_count", &v_free, &size, NULL, 0);
