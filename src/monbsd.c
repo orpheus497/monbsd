@@ -766,27 +766,42 @@ void gather_data(struct mon_data *d) {
 
     d->swap_usage = (d->swap_total > 0) ? (100.0 * d->swap_used / d->swap_total) : 0;
 
-    d->disk_count = 0;
-    int nfs = getfsstat(NULL, 0, MNT_NOWAIT);
-    if (nfs > 0) {
-        struct statfs *fs = malloc(sizeof(struct statfs) * nfs);
-        if (fs != NULL) {
-            nfs = getfsstat(fs, sizeof(struct statfs) * nfs, MNT_NOWAIT);
-            const char *targets[] = {"/", "/boot/efi", "/tmp", "/zroot", d->home_path};
-            for (int j = 0; j < 5; j++) {
-                if (targets[j][0] == '\0') continue;
-                for (int i = 0; i < nfs && d->disk_count < MAX_DISKS; i++) {
-                    if (strcmp(fs[i].f_mntonname, targets[j]) == 0) {
-                        strlcpy(d->disks[d->disk_count].mount, fs[i].f_mntonname, sizeof(d->disks[d->disk_count].mount));
-                        d->disks[d->disk_count].total_bytes = (long long)fs[i].f_blocks * fs[i].f_bsize;
-                        d->disks[d->disk_count].used_bytes = (long long)(fs[i].f_blocks - fs[i].f_bfree) * fs[i].f_bsize;
-                        d->disks[d->disk_count].usage = 100.0 * d->disks[d->disk_count].used_bytes / d->disks[d->disk_count].total_bytes;
-                        d->disk_count++; break;
+    static struct disk_entry cached_disks[MAX_DISKS];
+    static int cached_disk_count = 0;
+    static int disk_init = 0;
+
+    if (!disk_init || tick_count % 50 == 0) {
+        cached_disk_count = 0;
+        int nfs = getfsstat(NULL, 0, MNT_NOWAIT);
+        if (nfs > 0) {
+            struct statfs *fs = malloc(sizeof(struct statfs) * nfs);
+            if (fs != NULL) {
+                nfs = getfsstat(fs, sizeof(struct statfs) * nfs, MNT_NOWAIT);
+                const char *targets[] = {"/", "/boot/efi", "/tmp", "/zroot", d->home_path};
+                for (int j = 0; j < 5; j++) {
+                    if (targets[j][0] == '\0') continue;
+                    for (int i = 0; i < nfs && cached_disk_count < MAX_DISKS; i++) {
+                        if (strcmp(fs[i].f_mntonname, targets[j]) == 0) {
+                            strlcpy(cached_disks[cached_disk_count].mount, fs[i].f_mntonname, sizeof(cached_disks[cached_disk_count].mount));
+                            cached_disks[cached_disk_count].total_bytes = (long long)fs[i].f_blocks * fs[i].f_bsize;
+                            cached_disks[cached_disk_count].used_bytes = (long long)(fs[i].f_blocks - fs[i].f_bfree) * fs[i].f_bsize;
+                            cached_disks[cached_disk_count].usage = 100.0 * cached_disks[cached_disk_count].used_bytes / cached_disks[cached_disk_count].total_bytes;
+                            cached_disk_count++; break;
+                        }
                     }
                 }
+                free(fs);
             }
-            free(fs);
         }
+        disk_init = 1;
+    }
+
+    d->disk_count = cached_disk_count;
+    for (int i = 0; i < d->disk_count; i++) {
+        strlcpy(d->disks[i].mount, cached_disks[i].mount, sizeof(d->disks[i].mount));
+        d->disks[i].total_bytes = cached_disks[i].total_bytes;
+        d->disks[i].used_bytes = cached_disks[i].used_bytes;
+        d->disks[i].usage = cached_disks[i].usage;
     }
 }
 
