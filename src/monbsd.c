@@ -367,6 +367,21 @@ static void *update_pkg_counts_thread(void *arg) {
     return NULL;
 }
 
+static int check_pid_file_liveness(const char *pid_file) {
+    FILE *fp = fopen(pid_file, "r");
+    if (!fp) return 0;
+
+    int pid = 0;
+    if (fscanf(fp, "%d", &pid) == 1 && pid > 0) {
+        if (kill(pid, 0) == 0 || errno == EPERM) {
+            fclose(fp);
+            return 1;
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
 void gather_data(struct mon_data *d) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
@@ -494,33 +509,8 @@ void gather_data(struct mon_data *d) {
     static int cached_powerdxx = 0;
 
     if (tick_count % 20 == 0) {
-        int mib[3];
-        size_t len;
-        struct kinfo_proc *kp;
-
-        mib[0] = CTL_KERN;
-        mib[1] = KERN_PROC;
-        mib[2] = KERN_PROC_ALL;
-
-        if (sysctl(mib, 3, NULL, &len, NULL, 0) == 0) {
-            len = len * 4 / 3; /* Allocate extra buffer to prevent race conditions */
-            kp = malloc(len);
-            if (kp != NULL) {
-                if (sysctl(mib, 3, kp, &len, NULL, 0) == 0) {
-                    int found_powerd = 0;
-                    int found_powerdxx = 0;
-                    int nproc = len / sizeof(struct kinfo_proc);
-                    for (int i = 0; i < nproc; i++) {
-                        if (strcmp(kp[i].ki_comm, "powerd") == 0) found_powerd = 1;
-                        else if (strcmp(kp[i].ki_comm, "powerdxx") == 0) found_powerdxx = 1;
-                        if (found_powerd && found_powerdxx) break;
-                    }
-                    cached_powerd = found_powerd;
-                    cached_powerdxx = found_powerdxx;
-                }
-                free(kp);
-            }
-        }
+        cached_powerd = check_pid_file_liveness("/var/run/powerd.pid");
+        cached_powerdxx = check_pid_file_liveness("/var/run/powerdxx.pid");
     }
 
     d->powerd_running = cached_powerd;
