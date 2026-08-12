@@ -9,6 +9,10 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
+#ifndef INET_ADDRSTRLEN
+#define INET_ADDRSTRLEN 16
+#endif
+
 /* Fallback strlcpy */
 size_t my_strlcpy(char *dst, const char *src, size_t siz)
 {

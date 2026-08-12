@@ -258,10 +258,14 @@ static void get_ip_address(struct ifaddrs *ifaddr, const char *ifname, char *ip_
 
 int direct_cpu_cores() {
 #if MONBSD_X86
+    static int cached_cores = 0;
+    if (cached_cores > 0) return cached_cores;
+
     u_int regs[4];
     do_cpuid(1, regs);
     int cores = (regs[1] >> 16) & 0xFF;
-    return cores > 0 ? cores : 1;
+    cached_cores = cores > 0 ? cores : 1;
+    return cached_cores;
 #else
     return 1;
 #endif
@@ -342,8 +346,17 @@ int direct_pci_count() {
 }
 
 static int count_dir_executables(const char *path) {
+    uid_t orig_euid = geteuid();
+    uid_t ruid = getuid();
+
+    if (seteuid(ruid) != 0)
+        return 0;
+
     DIR *dir = opendir(path);
-    if (!dir) return 0;
+    if (!dir) {
+        if (seteuid(orig_euid) != 0) exit(1);
+        return 0;
+    }
     int count = 0;
     struct dirent *e;
     int dfd = dirfd(dir);
@@ -365,6 +378,9 @@ static int count_dir_executables(const char *path) {
         }
     }
     closedir(dir);
+
+    if (seteuid(orig_euid) != 0) exit(1);
+
     return count;
 }
 
@@ -475,6 +491,21 @@ static void *update_nvidia_thread(void *arg) {
     return NULL;
 }
 
+static int check_pid_file_liveness(const char *pid_file) {
+    FILE *fp = fopen(pid_file, "r");
+    if (!fp) return 0;
+
+    int pid = 0;
+    if (fscanf(fp, "%d", &pid) == 1 && pid > 0) {
+        if (kill(pid, 0) == 0 || errno == EPERM) {
+            fclose(fp);
+            return 1;
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
 void gather_data(struct mon_data *d) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
@@ -530,17 +561,28 @@ void gather_data(struct mon_data *d) {
         ncpu = direct_cpu_cores();   /* x86 fallback; returns >= 1 */
     d->cpu_threads = ncpu;
 
-    size = sizeof(d->mem_total); sysctlbyname("hw.physmem", &d->mem_total, &size, NULL, 0);
-    unsigned int active, wire, v_free; int pagesize; size = sizeof(pagesize); sysctlbyname("hw.pagesize", &pagesize, &size, NULL, 0);
+    static int hw_initialized = 0;
+    static long long cached_mem_total = 0;
+    static int cached_pagesize = 0;
+
+    if (!hw_initialized) {
+        size = sizeof(cached_mem_total); sysctlbyname("hw.physmem", &cached_mem_total, &size, NULL, 0);
+        size = sizeof(cached_pagesize); sysctlbyname("hw.pagesize", &cached_pagesize, &size, NULL, 0);
+        hw_initialized = 1;
+    }
+
+    d->mem_total = cached_mem_total;
+    unsigned int active = 0, wire = 0, v_free = 0;
+    int pagesize = cached_pagesize;
     size = sizeof(active); sysctlbyname("vm.stats.vm.v_active_count", &active, &size, NULL, 0);
-    sysctlbyname("vm.stats.vm.v_wire_count", &wire, &size, NULL, 0);
-    sysctlbyname("vm.stats.vm.v_free_count", &v_free, &size, NULL, 0);
+    size = sizeof(wire); sysctlbyname("vm.stats.vm.v_wire_count", &wire, &size, NULL, 0);
+    size = sizeof(v_free); sysctlbyname("vm.stats.vm.v_free_count", &v_free, &size, NULL, 0);
     d->mem_used = (long long)(active + wire) * pagesize;
     d->mem_usage = 100.0 * d->mem_used / d->mem_total;
 
-    static int soft_ticks = 0;
-    if (soft_ticks-- <= 0) {
-        soft_ticks = 10;
+    static int pkg_ticks = 0;
+    if (pkg_ticks-- <= 0) {
+        pkg_ticks = 3000;
 
         if (__atomic_load_n(&g_pkg_thread_running, __ATOMIC_ACQUIRE) == 0) {
             __atomic_store_n(&g_pkg_thread_running, 1, __ATOMIC_RELEASE);
@@ -553,6 +595,11 @@ void gather_data(struct mon_data *d) {
             }
             pthread_attr_destroy(&attr);
         }
+    }
+
+    static int soft_ticks = 0;
+    if (soft_ticks-- <= 0) {
+        soft_ticks = 10;
 
         d->linux_count = 0;
         DIR *dir = opendir("/compat/linux/usr/bin");
@@ -567,16 +614,21 @@ void gather_data(struct mon_data *d) {
         }
         d->pci_device_count = cached_pci_count;
 
-        d->user_bin_count = 0;
-        if (d->home_dir[0]) {
-            char probe[MAXPATHLEN];
-            snprintf(probe, sizeof(probe), "%s/.local/bin", d->home_dir);
-            d->user_bin_count += count_dir_executables(probe);
-            snprintf(probe, sizeof(probe), "%s/bin", d->home_dir);
-            d->user_bin_count += count_dir_executables(probe);
-            snprintf(probe, sizeof(probe), "%s/local/bin", d->home_dir);
-            d->user_bin_count += count_dir_executables(probe);
+        static int cached_user_bin_count = -1;
+        if (cached_user_bin_count == -1 || tick_count % 100 == 0) {
+            int current_user_bin_count = 0;
+            if (d->home_dir[0]) {
+                char probe[MAXPATHLEN];
+                snprintf(probe, sizeof(probe), "%s/.local/bin", d->home_dir);
+                current_user_bin_count += count_dir_executables(probe);
+                snprintf(probe, sizeof(probe), "%s/bin", d->home_dir);
+                current_user_bin_count += count_dir_executables(probe);
+                snprintf(probe, sizeof(probe), "%s/local/bin", d->home_dir);
+                current_user_bin_count += count_dir_executables(probe);
+            }
+            cached_user_bin_count = current_user_bin_count;
         }
+        d->user_bin_count = cached_user_bin_count;
     }
 
     d->pkg_count = __atomic_load_n(&g_pkg_count, __ATOMIC_RELAXED);
@@ -604,33 +656,8 @@ void gather_data(struct mon_data *d) {
     static int cached_powerdxx = 0;
 
     if (tick_count % 20 == 0) {
-        int mib[3];
-        size_t len;
-        struct kinfo_proc *kp;
-
-        mib[0] = CTL_KERN;
-        mib[1] = KERN_PROC;
-        mib[2] = KERN_PROC_ALL;
-
-        if (sysctl(mib, 3, NULL, &len, NULL, 0) == 0) {
-            len = len * 4 / 3; /* Allocate extra buffer to prevent race conditions */
-            kp = malloc(len);
-            if (kp != NULL) {
-                if (sysctl(mib, 3, kp, &len, NULL, 0) == 0) {
-                    int found_powerd = 0;
-                    int found_powerdxx = 0;
-                    int nproc = len / sizeof(struct kinfo_proc);
-                    for (int i = 0; i < nproc; i++) {
-                        if (strcmp(kp[i].ki_comm, "powerd") == 0) found_powerd = 1;
-                        else if (strcmp(kp[i].ki_comm, "powerdxx") == 0) found_powerdxx = 1;
-                        if (found_powerd && found_powerdxx) break;
-                    }
-                    cached_powerd = found_powerd;
-                    cached_powerdxx = found_powerdxx;
-                }
-                free(kp);
-            }
-        }
+        cached_powerd = check_pid_file_liveness("/var/run/powerd.pid");
+        cached_powerdxx = check_pid_file_liveness("/var/run/powerdxx.pid");
     }
 
     d->powerd_running = cached_powerd;
@@ -784,9 +811,9 @@ void gather_data(struct mon_data *d) {
     }
 
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    long cp_time[CPUSTATES]; size = sizeof(cp_time); sysctlbyname("kern.cp_time", cp_time, &size, NULL, 0);
+    long cp_time[CPUSTATES] = {0}; size = sizeof(cp_time); sysctlbyname("kern.cp_time", cp_time, &size, NULL, 0);
     
-    int ifc; size = sizeof(ifc); sysctlbyname("net.link.generic.system.ifcount", &ifc, &size, NULL, 0);
+    int ifc = 0; size = sizeof(ifc); sysctlbyname("net.link.generic.system.ifcount", &ifc, &size, NULL, 0);
     d->if_count = 0;
 
     struct ifaddrs *ifaddr = NULL;
@@ -892,31 +919,50 @@ void gather_data(struct mon_data *d) {
 
     d->swap_usage = (d->swap_total > 0) ? (100.0 * d->swap_used / d->swap_total) : 0;
 
-    int nfs = getfsstat(NULL, 0, MNT_NOWAIT);
-    struct statfs *fs = malloc(sizeof(struct statfs) * nfs);
-    nfs = getfsstat(fs, sizeof(struct statfs) * nfs, MNT_NOWAIT);
-    d->disk_count = 0;
-    const char *targets[] = {"/", "/boot/efi", "/tmp", "/zroot", d->home_path};
-    for (int j = 0; j < 5; j++) {
-        if (targets[j][0] == '\0') continue;
-        int dup = 0;
-        for (int k = 0; k < j; k++)
-            if (strcmp(targets[j], targets[k]) == 0) { dup = 1; break; }
-        if (dup) continue;
-        for (int i = 0; i < nfs && d->disk_count < MAX_DISKS; i++) {
-            if (strcmp(fs[i].f_mntonname, targets[j]) == 0) {
-                if (fs[i].f_blocks > 0) {
-                    strlcpy(d->disks[d->disk_count].mount, fs[i].f_mntonname, sizeof(d->disks[d->disk_count].mount));
-                    d->disks[d->disk_count].total_bytes = (long long)fs[i].f_blocks * fs[i].f_bsize;
-                    d->disks[d->disk_count].used_bytes = (long long)(fs[i].f_blocks - fs[i].f_bfree) * fs[i].f_bsize;
-                    d->disks[d->disk_count].usage = 100.0 * d->disks[d->disk_count].used_bytes / d->disks[d->disk_count].total_bytes;
-                    d->disk_count++;
+    static struct disk_entry cached_disks[MAX_DISKS];
+    static int cached_disk_count = 0;
+    static int disk_init = 0;
+
+    if (!disk_init || tick_count % 50 == 0) {
+        cached_disk_count = 0;
+        int nfs = getfsstat(NULL, 0, MNT_NOWAIT);
+        if (nfs > 0) {
+            struct statfs *fs = malloc(sizeof(struct statfs) * nfs);
+            if (fs != NULL) {
+                nfs = getfsstat(fs, sizeof(struct statfs) * nfs, MNT_NOWAIT);
+                const char *targets[] = {"/", "/boot/efi", "/tmp", "/zroot", d->home_path};
+                for (int j = 0; j < 5; j++) {
+                    if (targets[j][0] == '\0') continue;
+                    int dup = 0;
+                    for (int k = 0; k < j; k++)
+                        if (strcmp(targets[j], targets[k]) == 0) { dup = 1; break; }
+                    if (dup) continue;
+                    for (int i = 0; i < nfs && cached_disk_count < MAX_DISKS; i++) {
+                        if (strcmp(fs[i].f_mntonname, targets[j]) == 0) {
+                            if (fs[i].f_blocks > 0) {
+                                strlcpy(cached_disks[cached_disk_count].mount, fs[i].f_mntonname, sizeof(cached_disks[cached_disk_count].mount));
+                                cached_disks[cached_disk_count].total_bytes = (long long)fs[i].f_blocks * fs[i].f_bsize;
+                                cached_disks[cached_disk_count].used_bytes = (long long)(fs[i].f_blocks - fs[i].f_bfree) * fs[i].f_bsize;
+                                cached_disks[cached_disk_count].usage = 100.0 * cached_disks[cached_disk_count].used_bytes / cached_disks[cached_disk_count].total_bytes;
+                                cached_disk_count++;
+                            }
+                            break;
+                        }
+                    }
                 }
-                break;
+                free(fs);
             }
         }
+        disk_init = 1;
     }
-    free(fs);
+
+    d->disk_count = cached_disk_count;
+    for (int i = 0; i < d->disk_count; i++) {
+        strlcpy(d->disks[i].mount, cached_disks[i].mount, sizeof(d->disks[i].mount));
+        d->disks[i].total_bytes = cached_disks[i].total_bytes;
+        d->disks[i].used_bytes = cached_disks[i].used_bytes;
+        d->disks[i].usage = cached_disks[i].usage;
+    }
 }
 
 void draw_box(int y, int x, int h, int w, const char *title) {
