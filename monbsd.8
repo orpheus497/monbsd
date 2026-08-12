@@ -1,4 +1,4 @@
-.Dd March 11, 2026
+.Dd August 12, 2026
 .Dt MONBSD 8
 .Os
 .Sh NAME
@@ -19,7 +19,7 @@ System uptime, load average, and CPU model.
 .It
 Real-time CPU and GPU temperatures.
 .It
-CPU frequency and core usage.
+CPU frequency and logical CPU (thread) count.
 .It
 Memory and swap usage.
 .It
@@ -31,6 +31,25 @@ ACPI states, battery status, and fan speed (where supported).
 .It
 Counts of installed packages and ports.
 .El
+.Sh ENVIRONMENT
+The environment is scrubbed with
+.Xr clearenv 3
+at startup.
+The following variables are honored or re-injected:
+.Bl -tag -width "SUDO_UID"
+.It Ev TERM
+Validated against the character set
+.Va [A-Za-z0-9._+-]
+(maximum 64 characters) and re-injected after scrubbing; invalid values are
+discarded.
+.It Ev PATH
+Reset to a fixed system list
+.Pq /bin:/usr/bin:/sbin:/usr/sbin:/usr/local/sbin:/usr/local/bin .
+.It Ev SUDO_UID
+Consulted to resolve the invoking user's home directory when run via
+.Xr sudo 8 .
+.El
+All other environment variables are cleared.
 .Sh FILES
 .Bl -tag -width "/dev/cpuctl0" -compact
 .It Pa /dev/cpuctl*
@@ -39,13 +58,37 @@ Used for direct MSR access to read CPU temperature and performance counters.
 Used for direct PCI configuration space access.
 .El
 .Sh PRIVILEGES
+For full telemetry,
 .Nm
-requires access to
+opens
 .Pa /dev/cpuctl0
 and
-.Pa /dev/io .
-It is typically installed with setuid root or must be run via
+.Pa /dev/io
+at startup, which requires root; it is typically installed setuid root or run
+via
 .Xr sudo 8 .
+Both descriptors are opened close-on-exec and, if the effective uid is 0,
+privileges are permanently dropped with
+.Xr setresgid 2
+and
+.Xr setresuid 2
+before the user interface starts; failure to drop is fatal (fail closed).
+The descriptors remain usable after the drop because credential checks happen
+at
+.Xr open 2
+time.
+.Pp
+When run without the ability to open those devices,
+.Nm
+continues with reduced telemetry: CPU temperature falls back to the ACPI
+thermal zone sysctl, live frequency falls back to
+.Va dev.cpu.0.freq ,
+and the PCI device count is reported as
+.Dq N/A .
+.Pp
+MSR-based temperatures, APERF/MPERF live frequency, and direct PCI counting
+require the amd64 or i386 architecture; other architectures build and run
+with reduced telemetry.
 .Sh INTERACTIVE COMMANDS
 The following keys can be used while
 .Nm
@@ -53,6 +96,17 @@ is running:
 .Bl -tag -width "q, Q, Ctrl+C" -compact
 .It Ic q, Q, Ctrl+C
 Exit the program.
+.El
+.Sh EXIT STATUS
+.Bl -tag -width "128+signo" -compact
+.It 0
+User quit
+.Pq Ic q , Ic Q , No or Ctrl+C .
+.It 1
+Startup failure (non-terminal stdin/stdout, environment sanitization failure,
+or privilege-drop failure).
+.It 128+signo
+Terminated by a signal; the terminal is restored before exiting.
 .El
 .Sh SEE ALSO
 .Xr sysctl 8 ,

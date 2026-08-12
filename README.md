@@ -14,7 +14,17 @@
 ## Prerequisites
 
 - **FreeBSD:** Developed and tested on FreeBSD.
-- **Permissions:** `monbsd` requires access to `/dev/cpuctl` and `/dev/io` for direct hardware monitoring. It is recommended to install it with setuid root or run it with `sudo`.
+- **Architecture:** Full telemetry (MSR CPU temperatures, APERF/MPERF live frequency, direct PCI device counting) requires **amd64 or i386**. Other architectures build and run with reduced telemetry.
+- **Permissions:** For full telemetry, `monbsd` opens `/dev/cpuctl0` and `/dev/io` at startup. It is recommended to install it with setuid root (`make install`) or run it with `sudo`. Privileges are permanently dropped before the UI starts; only the two pre-opened, close-on-exec device descriptors are retained.
+
+Without `/dev/cpuctl0` / `/dev/io` access, `monbsd` still runs with reduced telemetry:
+
+| Probe | Without device access |
+|-------|-----------------------|
+| CPU temperature | ACPI thermal zone sysctl |
+| Live frequency | `dev.cpu.0.freq` |
+| PCI device count | reported as "N/A" |
+| Everything else | unchanged |
 
 ## Installation
 
@@ -25,7 +35,15 @@ make
 sudo make install
 ```
 
-This will install the binary to `/usr/local/bin/monbsd` with the necessary permissions.
+This installs the binary to `/usr/local/bin/monbsd` setuid root (needed only to open `/dev/cpuctl0` and `/dev/io` at startup; privileges are permanently dropped before the UI starts).
+
+For a per-user install without setuid (reduced telemetry):
+
+```bash
+make install-user
+```
+
+This installs to `~/.local/bin/monbsd`. Remove it with `make uninstall-user`.
 
 ## Usage
 
@@ -41,10 +59,20 @@ Press `q` to exit.
 
 `monbsd` is currently zero-config. It automatically detects hardware and network interfaces.
 
+## Development
+
+```bash
+make tests   # build the test programs
+make check   # run tests; hardware tests SKIP (exit 77) without /dev access
+make bench   # build the benchmarks
+```
+
+`make check` is an x86 (amd64/i386) target: `test_compile`, `test_cpuid`, `test_cpuctl`, `test_aperf`, and `test_pci` exercise x86-specific interfaces.
+
 ## License
 
 This project is licensed under the 2-Clause BSD License. See the [LICENSE](LICENSE) file for details.
 
 ## Version
 
-v0.1.0
+v0.1.1

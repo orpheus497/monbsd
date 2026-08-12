@@ -3,12 +3,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 #include <ifaddrs.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <sys/types.h>
-
-#define INET_ADDRSTRLEN 16
 
 /* Fallback strlcpy */
 size_t my_strlcpy(char *dst, const char *src, size_t siz)

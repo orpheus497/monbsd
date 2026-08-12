@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -8,7 +10,14 @@
 
 int main() {
     int fd = open("/dev/cpuctl0", O_RDWR);
-    if (fd < 0) { perror("open"); return 1; }
+    if (fd < 0) {
+        if (errno == EACCES || errno == EPERM || errno == ENOENT) {
+            fprintf(stderr, "SKIP: /dev/cpuctl0 unavailable: %s\n", strerror(errno));
+            return 77;
+        }
+        perror("open");
+        return 1;
+    }
 
     cpuctl_msr_args_t mperf_args = { .msr = 0xE7 };
     cpuctl_msr_args_t aperf_args = { .msr = 0xE8 };
