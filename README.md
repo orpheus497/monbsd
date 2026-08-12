@@ -16,14 +16,15 @@
 - **FreeBSD:** Developed and tested on FreeBSD.
 - **Architecture:** Full telemetry (MSR CPU temperatures, APERF/MPERF live frequency, direct PCI device counting) requires **amd64 or i386**. Other architectures build and run with reduced telemetry.
 - **Permissions:** For full telemetry, `monbsd` opens `/dev/cpuctl0` and `/dev/io` at startup. It is recommended to install it with setuid root (`make install`) or run it with `sudo`. Privileges are permanently dropped before the UI starts; only the two pre-opened, close-on-exec device descriptors are retained.
+- **Kernel module:** MSR CPU temperatures and APERF/MPERF live frequency require the `cpuctl` module — `kldload cpuctl`, or `cpuctl_load="YES"` in `/boot/loader.conf`. Without it, ACPI/sysctl fallbacks are used.
 
 Without `/dev/cpuctl0` / `/dev/io` access, `monbsd` still runs with reduced telemetry:
 
 | Probe | Without device access |
 |-------|-----------------------|
-| CPU temperature | ACPI thermal zone sysctl |
+| CPU temperature | ACPI thermal zone sysctl (or "N/A" if none) |
 | Live frequency | `dev.cpu.0.freq` |
-| PCI device count | reported as "N/A" |
+| PCI device count | enumerated via `pciconf -l` (unprivileged, all architectures) |
 | Everything else | unchanged |
 
 ## Installation
@@ -59,6 +60,11 @@ Press `q` to exit.
 
 `monbsd` is currently zero-config. It automatically detects hardware and network interfaces.
 
+## Notes
+
+- **"Ports" count:** packages whose `pkg` repository name is exactly `local` (ports-tree installs). Packages built by poudriere/synth carry the builder's repository name and are not counted. pkg data refreshes about every 60 seconds; a failed query keeps the last known value, showing "N/A" until a query succeeds.
+- **powerd/powerdxx:** detected by an exact-name process scan via the `kern.proc` sysctl. Non-root runs need the default `security.bsd.see_other_uids=1` setting to see root-owned daemons.
+
 ## Development
 
 ```bash
@@ -75,4 +81,4 @@ This project is licensed under the 2-Clause BSD License. See the [LICENSE](LICEN
 
 ## Version
 
-v0.1.1
+v0.1.2

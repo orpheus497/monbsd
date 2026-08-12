@@ -1,462 +1,401 @@
-# monbsd v0.1.0 — Code Review Remediation Plan
+# monbsd — Regression Analysis & Restoration Plan (v0.1.1 → v0.1.2)
 
-This plan addresses every finding from the v0.1.0 code review (S1–S3, C1–C8, L1–L7)
-plus five additional issues discovered while analyzing the code against the review
-(N1–N5). All line references are to `src/monbsd.c` r1092 unless noted.
+**Scope.** This document supersedes the v0.1.0 remediation plan (S1–S3, C1–C8,
+L1–L7, N1–N5), which is **fully implemented** on this branch and now lives in
+`CHANGELOG.md` under `[0.1.1]`. What follows is (1) a review of this branch
+versus `main`, (2) a deep root-cause analysis of the three regressions now
+visible in the UI — **PCI shows "N/A"**, **Ports shows "0"**, and the **power
+subsystem is misreported** — and (3) a comprehensive, FreeBSD-only restoration
+plan. All line references are to the current `src/monbsd.c` (1309 lines)
+unless noted.
 
----
-
-## 0. Newly discovered issues (not in the review)
-
-| ID | Issue | Evidence | Disposition |
-|----|-------|----------|-------------|
-| N1 | **Tree does not compile as-is.** `sanitize_str()` is called but never defined; `struct ieee80211req` / `IEEE80211_IOC_SSID` are used without `<net/if_ieee80211.h>`. The `monbsd` binary at repo root is stale (predates the half-merged SSID work). | `src/monbsd.c:200` (call), `:185-193` (ieee80211req use), includes at `:1-32` (no `net/if_ieee80211.h`) | Resolved by S3 (define `sanitize_str`) + L3 (add include, wire feature) |
-| N2 | **Cached device fds must be `O_CLOEXEC`.** S1's open-once pattern keeps `/dev/io` and `/dev/cpuctl0` open for life; without close-on-exec, unprivileged `popen_safe()` children inherit them → I/O-port + MSR access as the invoking user (privesc). | `popen_safe()` at `:323-344` | Mandatory part of S1 design |
-| N3 | `print_val()` label clamp goes negative at w=5..7: `lbl_len > w - 6` assigns `lbl_len = -1`; negative precision is ignored by `printf`, printing the full label and breaking the border. Same family as C8. | `:806` | Fixed alongside C8 |
-| N4 | PCI count of `-1` (non-root / non-x86) renders as `-1 devices`. | `:466`, `:863-864` | Render "N/A" when `< 0` (folds into S1/L2 degradation paths) |
-| N5 | Review claims "`exit(1)` inside `count_dir_executables()`" and "privileges temporarily dropped in `count_dir_executables()`" — neither exists in the code. No action possible/needed; S1 makes it moot. | `:296-321` | Documented; no code change |
+Target audience/platform: **FreeBSD only**. Every mechanism proposed here is a
+native FreeBSD interface (`pciconf(8)`, `pkg-query(8)`, `sysctl(3)` /
+`kern.proc`, ACPI sysctls, `/dev/io`, `/dev/cpuctl0`, devfs). No Linux-isms,
+no cross-platform shims.
 
 ---
 
-## 1. Findings matrix
+## 1. Branch review: `perf/optimize-getifaddrs-*` vs `main`
 
-| ID | Finding | Fix location(s) | Effort | Risk |
-|----|---------|-----------------|--------|------|
-| S1 | Root held for process lifetime | `main()` `:1007`, `direct_cpu_temp()` `:225`, `direct_cpu_live_freq()` `:246`, `direct_pci_count()` `:268` | Medium | Medium (telemetry regressions if fd-caching assumption fails) |
-| S2 | No SIGINT/SIGTERM/SIGHUP handlers | `main()` `:1071`, main loop `:1074` | Low | Low |
-| S3 | Unsanitized system strings | new helper; call sites `:391`, `:413`, `:495`, `:497`, `:545`, `:585` | Low | Low |
-| C1 | "Cores" = logical threads | `direct_cpu_cores()` `:218`, `gather_data()` `:429`, label `:852` | Low | Low |
-| C2 | nvidia-smi blocks render loop | `gather_data()` `:615-648` | Medium | Medium (threading) |
-| C3 | freq_levels "3600/70000 MHz" | `render_thermal_power_box()` `:944-950` | Trivial | None |
-| C4 | Header off-center (24 vs 26) | `render()` `:999-1000` | Trivial | None |
-| C5 | Duplicate disk rows | `gather_data()` `:778-790` | Low | None |
-| C6 | Battery magic values | `gather_data()` `:536-542` | Low | None |
-| C7 | Ports "local" substring | `update_pkg_counts_thread()` `:374-376` | Low | None |
-| C8 | print_val negative precision | `print_val()` `:802-816` | Low | None |
-| L1 | No isatty() guard | `main()` `:1059-1070` | Trivial | None |
-| L2 | x86-only, no guards | includes `:23-25`, `direct_*()` `:218-294`, brand `:401-412` | Medium | Low |
-| L3 | Dead/half-merged SSID | `:51-59`, `:173-203`, iface loop `:688-719`, render `:961-975` | Medium | Low |
-| L4 | Makefile gaps | `Makefile` | Low | None |
-| L5 | Div-by-zero f_blocks==0 | `gather_data()` `:784-786` | Trivial | None |
-| L6 | GNU pattern rule vs bmake | `Makefile:20-21` | Trivial | None |
-| L7 | Man/README gaps | `monbsd.8`, `README.md` | Low | None |
+The branch contains two bodies of work:
 
----
+1. **Merged from `main`** (`33bcdbc`) — a batch of bot-generated "performance /
+   security" PRs (#21–#37).
+2. **Branch-local** (`9ea2af1`, `d3bff5c`, `eb2af17`) — the v0.1.0 review
+   remediation (privilege-drop lifecycle, sanitization, arch guards, SSID
+   completion, signal handlers, nvidia thread, UI fixes).
 
-## 2. Detailed designs
+### 1.1 Verdicts on the merged `main` commits
 
-### S1 — Permanent privilege drop after startup fd acquisition
+| Commit | Change | Verdict |
+|--------|--------|---------|
+| `e6d25af` | TERM sanitization before setuid install | Sound. Keep. |
+| `9fb0076`/`b6bed17` | pkg / blocking subprocesses on detached threads | Sound pattern (release/acquire flags, detached pthreads). Keep. |
+| `852be84` | `d_type` fast path in `count_dir_executables()` | Sound. Keep. |
+| `f86287f` | NULL-deref fix in `getfsstat` handling | Sound. Keep. |
+| `5b6107a`/`a3b549c` | Uninitialized-variable fixes | Sound. Keep. |
+| `29fa495` | Privilege drop inside `count_dir_executables()` | Now a harmless no-op after S1 (euid == ruid permanently). Keep; optionally simplify later. |
+| `4cd9cd6` | Cache CPU core count | Superseded by C1 (`kern.smp.cpus` each tick, `src/monbsd.c:559-562`). Keep. |
+| `43e98b3` | Cache `user_bin_count` directory traversal | Sound. Keep. |
+| `9158028` | Cache `hw.physmem`/`hw.pagesize` | Sound. Keep. |
+| `7bacc56` | Reduce disk query frequency (50-tick cache) | Sound. Keep. |
+| `9dab7a8`/`2daa087` | N+1 `getifaddrs` fix (single call per tick) | Sound. Keep. |
+| `0cc37f6` (#36) | pkg queries every **3000 ticks (~5 min)** | Harmful *amplifier*, not a root cause — see **R2**. Any failed pkg probe now persists for 5 minutes. |
+| `747d8ae` (#37) | powerd/powerdxx detection via **pidfile + `kill(pid,0)`** | **REGRESSION — root cause of R3a.** Replaced a correct, unprivileged `KERN_PROC` exact-name scan with a pidfile read that fails for any non-root process. Revert per §3.3. |
 
-**Current state.** euid root for the entire process lifetime. `/dev/cpuctl0` is opened
-and closed on *every* probe in `direct_cpu_temp()` (`:226`) and `direct_cpu_live_freq()`
-(`:248`); `/dev/io` likewise in `direct_pci_count()` (`:269`). All rendering/parsing code
-runs as root.
+### 1.2 Verdicts on branch-local (v0.1.1 remediation) changes
 
-**Why the cached-fd pattern is safe on FreeBSD.** Credential checks happen at `open(2)`
-time (devfs node permissions; `PRIV_IO` for `/dev/io`). `CPUCTL_RDMSR` ioctls on an
-already-open fd and userland `inl`/`outl` (I/O bitmap permission granted per-process at
-`/dev/io` open) do not re-check credentials. This is the classic Xorg privilege-separation
-pattern.
+All remediation items landed as designed in the old plan. Two of them,
+however, **interact** with the merged optimizations to produce the visible
+breakage:
 
-**Design.**
+- **S1 (open-once + permanent privilege drop, `src/monbsd.c:1250-1266`)** is
+  correct security design, but it converts every privileged-resource failure
+  into a *permanent, startup-time* failure: if `/dev/io` cannot be opened at
+  startup (non-setuid binary, non-root user), PCI is dead for the whole run.
+  Combined with **N4** ("render -1 as N/A", `:1040-1041`), the user-facing
+  result is `PCI Devices: N/A` — **R1**.
+- **N4's "N/A"** is the right *rendering*, but the plan never supplied an
+  unprivileged PCI counting fallback, even though one already exists in the
+  process: `pciconf(8)` is spawned at startup for GPU detection (`:696-738`)
+  and works for any user on any FreeBSD architecture.
+- The old plan's degradation matrix assumed "ACPI/sysctl fallbacks exist for
+  everything that matters." That assumption is false for PCI counting and was
+  never revisited after the merge brought in #36/#37.
 
-1. File-scope globals:
-   ```c
-   static int g_cpuctl_fd = -1;   /* /dev/cpuctl0, open for process lifetime */
-   static int g_io_fd = -1;       /* /dev/io, open for process lifetime */
-   ```
-2. In `main()`, ordering is significant:
-   1. Resolve home dir (unprivileged; uses real uid — unaffected by later drop). *unchanged*
-   2. Validate `TERM`. *unchanged*
-   3. `clearenv()` + re-inject `PATH`/`TERM`. *unchanged*
-   4. **Open** `g_cpuctl_fd = open("/dev/cpuctl0", O_RDWR | O_CLOEXEC)` and
-      `g_io_fd = open("/dev/io", O_RDWR | O_CLOEXEC)` while still euid root. Failure of
-      either open is non-fatal (fallback paths exist) — record and continue.
-   5. **Drop permanently:** if `geteuid() == 0`, then
-      `setresgid(rgid, rgid, rgid)` followed by `setresuid(ruid, ruid, ruid)`;
-      on failure, `fprintf(stderr, …)` + `exit(1)` (fail closed — never run the UI as root).
-   6. isatty guard (L1), raw mode, signals, loop. *as before*
-3. Refactor the three probes to use the cached fds:
-   - `direct_cpu_temp()`: `if (g_cpuctl_fd >= 0) { ioctl(…0x1A2…); ioctl(…0x19C…); }`
-     else fall through to the existing `hw.acpi.thermal.tz0.temperature` sysctl fallback.
-   - `direct_cpu_live_freq()`: use `g_cpuctl_fd`; else `return fallback_freq`.
-   - `direct_pci_count()`: `if (g_io_fd < 0) return -1;` then the existing scan (keep the
-     fd open; remove per-call open/close).
-4. `popen_safe()` keeps its child-side `setresgid/setresuid` to real ids — after S1 this is
-   a harmless no-op, retained as defense-in-depth.
-5. N4 follow-through: render `PCI Devices:` as "N/A" when `d->pci_device_count < 0`.
+### 1.3 New hygiene issue introduced on this branch
 
-**N2 (mandatory).** Both opens use `O_CLOEXEC` so `fork()`+`execv()` children
-(pkg/pciconf/swapinfo/nvidia-smi) never inherit the privileged descriptors.
-
-**Degradation matrix (non-setuid / non-root execution).**
-
-| Probe | Without root |
-|-------|--------------|
-| CPU temp | ACPI thermal zone sysctl (already present) |
-| Live freq | `dev.cpu.0.freq` fallback (already present) |
-| PCI count | "N/A" (new, N4) |
-| Everything else | Unchanged (all sysctls/subprocesses work unprivileged) |
+**H1 — A compiled `monbsd` binary is committed at the repo root** (added by
+`eb2af17`, 46 248 bytes; see `git diff main...HEAD --stat`). Consequences:
+stale-binary execution produces exactly the kind of "phantom regressions"
+being chased here; the binary is architecture-specific; it desynchronizes
+from `src/monbsd.c` on every edit. It must be removed from the index and
+covered by `.gitignore`.
 
 ---
 
-### S2 — Fatal-signal handlers with terminal restoration
+## 2. Regression root-cause analysis
 
-Raw mode clears `ISIG` (`:165`), so Ctrl-C arrives as byte `0x03` (already handled at
-`:1087`), but external `kill` bypasses `atexit(disable_raw_mode)` → user's terminal left
-with echo off / cursor hidden.
+### R1 — `PCI Devices: N/A`
 
-**Design.**
+**Code path.** `main()` opens `g_io_fd = open("/dev/io", O_RDWR|O_CLOEXEC)`
+once, while euid root, then permanently drops privileges
+(`src/monbsd.c:1254-1266`). `direct_pci_count()` (`:318-346`) returns `-1`
+immediately when `g_io_fd < 0`. The cache in `gather_data()` (`:608-615`)
+never updates on `-1`, and the renderer (`:1040-1041`) prints **"N/A"**.
 
-```c
-static volatile sig_atomic_t exit_signo = 0;
+**Why it breaks in practice.** devfs creates `/dev/io` as
+`crw------- root wheel`. Therefore:
 
-static void handle_exit_signal(int sig) { exit_signo = sig; }   /* async-signal-safe */
-```
+- plain `make && ./monbsd` (non-root) → `open()` fails with `EACCES` → N/A;
+- `make install-user` (mode 0755, no setuid — `Makefile:47-54`) → N/A,
+  permanently, by design of that target;
+- the **committed repo-root binary** (H1) run unprivileged → N/A;
+- only the setuid install (`make install`, `Makefile:66-72`, mode 4755) or
+  `sudo monbsd` opens the fd, and the cached-fd pattern then correctly
+  survives the privilege drop (I/O-port permission is granted per-process at
+  `open(2)` time — the Xorg pattern).
 
-- Install via `sigaction()` (no `SA_RESTART`, so `usleep()`/`read()` return early) for
-  `SIGINT`, `SIGTERM`, `SIGHUP` after `enable_raw_mode()` next to the existing
-  `SIGWINCH` install (`:1071`).
-- Loop-top check in the `while (1)` loop (`:1074`): if `exit_signo != 0` →
-  `clear_screen(); exit(128 + exit_signo);`. `exit()` runs the registered
-  `disable_raw_mode()` → termios restored, cursor shown. Worst-case latency one tick
-  (~100 ms) since `VMIN=0/VTIME=0` keeps `read()` non-blocking.
-- Exit status convention: `0` for `q`/`Q`/Ctrl-C byte; `128+signo` for signal death;
-  `1` for startup failures. Documented in man page (L7).
-- Detached pkg/nvidia threads require no join; `exit()` from the main thread terminates
-  them. No shared state is written by the atexit handler.
+**Root cause.** The direct CF8/CFC port scan is the *only* PCI enumeration
+source, and it is hard-gated on a root-only device node. On FreeBSD the
+canonical, unprivileged, arch-neutral enumerator already exists and is
+already used by this very program: `pciconf -l` (`:697`). The old plan's N4
+designed the "N/A" rendering but never wired the fallback.
 
----
+**Contrast with `main`:** `main` opened `/dev/io` per call and also returned
+`-1` on failure, but rendered the raw value (`-1 devices`) — wrong, yet
+"numeric". The branch made the failure honest without restoring the data.
 
-### S3 — Sanitize system strings before terminal output (also fixes N1)
+### R2 — `Ports: 0 built`
 
-**Design.** One helper, defined before `refresh_wifi_ssid()` (`:180`) so the existing
-call at `:200` compiles:
+**Code path.** `update_pkg_counts_thread()` (`:421-453`) runs
+`pkg query %r` via `popen_safe()` and counts lines; the C7 fix tightened the
+match from `strstr(line, "local")` to an exact, whitespace-trimmed
+`strcmp(p, "local")` (`:438-445`). Result stored to `g_ports_count`
+(`:446`), copied to the UI every tick (`:635`), rendered at `:1045-1046`.
 
-```c
-/* Replace terminal-hostile control bytes (incl. ESC) with spaces.
- * Bytes >= 0x80 are left intact so valid UTF-8 survives. */
-static void sanitize_str(char *s) {
-    for (; *s != '\0'; s++) {
-        unsigned char c = (unsigned char)*s;
-        if (c < 0x20 || c == 0x7f) *s = ' ';
-    }
-}
-```
+**Root cause — the query itself fails.** On the installed pkg, a bare `%r`
+format is rejected: pkg reports
+`Invalid query: '%r' should be followed by: n, o, v` and exits non-zero,
+printing nothing to stdout. (Observed directly on this host.) The thread
+then counts **zero lines and stores 0**. Note what this rules out:
 
-**Call sites** (review-named sources + cheap extras):
+- **C7 is not the cause.** `strstr` vs `strcmp` is irrelevant when pkg emits
+  no lines at all.
+- The failure is **invisible**: `popen_safe()` redirects the child's stderr
+  to `/dev/null` (`:396-397`), and the `pclose_safe()` exit status is
+  **ignored** at both store sites (`:431`, `:447`).
 
-| String | Sanitize after | Line |
-|--------|----------------|------|
-| `d->host` | `gethostname()` | `:391` |
-| `d->cpu_model` | `strlcpy` from brand/hw.model | `:413` |
-| `g_cache[i].model` (pciconf parse) | `strlcpy` | `:585` |
-| `d->cx_lowest` | sysctl read | `:495` |
-| `d->cx_usage` | sysctl read | `:497` |
-| `d->freq_levels` | sysctl read | `:545` |
-| SSID output | existing call | `:200` |
+**Amplifiers.**
 
-Program-generated constants (`thermal_state`, `fan_status`, `bat_*`, IP addresses) are
-not attacker-influenced; left as-is.
+1. **A2 — failures overwrite good data, and stick.** `__atomic_store_n(&g_ports_count, count)` runs unconditionally whenever `fork+exec` succeeded, regardless of pkg's exit status. Combined with **#36's 3000-tick (≈5-minute) cadence** (`:583-598`), a single bad query pins the display at 0 for five minutes; a permanently failing query pins it forever.
+2. **A3 — no "unknown" state.** The counters initialize to `0` (`:417-418`), so "not yet queried" and "queried, got zero" are indistinguishable. The UI has no N/A path for pkg/ports (unlike PCI post-N4).
 
----
+**Semantics note (pre-existing, worth documenting, not a bug):** the
+repository name `local` is what pkg records for packages installed outside
+any configured repository (classic ports-tree `make install`). Packages
+built by poudriere/synth carry that builder's repository name instead and
+will never be counted by *any* repo-name match. The man page should state
+what "Ports: N built" actually means.
 
-### C1 — Report logical CPUs as "Threads"
+### R3 — Power subsystem incorrectly handled
 
-`direct_cpu_cores()` (`:218-223`) returns CPUID leaf-1 EBX[23:16] = addressable logical
-processor IDs (2× cores on HT).
+The "THERMAL & POWER" box (`render_thermal_power_box()`, `:1055-1131`) is fed
+by several probes; the dominant breakage is powerd/powerdxx detection.
 
-**Design.**
-- Primary source: `kern.smp.cpus` sysctl (arch-neutral, exact logical CPU count):
-  ```c
-  int ncpu = 0; size_t sz = sizeof(ncpu);
-  if (sysctlbyname("kern.smp.cpus", &ncpu, &sz, NULL, 0) != 0 || ncpu <= 0)
-      ncpu = direct_cpu_cores();   /* x86 fallback; returns >= 1 */
-  d->cpu_threads = ncpu;
-  ```
-- Rename struct field `cpu_cores` → `cpu_threads` (`:76`, uses at `:429`, `:851-852`).
-- Relabel UI `"Cores:"` → `"Threads:"` (`:852`). `direct_cpu_cores()` is retained as the
-  fallback, wrapped in the L2 x86 guard (non-x86 fallback is simply `1`).
+#### R3a — `powerd: Stopped ✗` / `powerdxx: Stopped ✗` while powerd is running
 
-### C2 — nvidia-smi on a detached thread (mirror the pkg pattern)
+**What changed.** Commit `747d8ae` (merged from `main`) replaced the previous
+implementation — a `KERN_PROC` sysctl scan doing an **exact `ki_comm` name
+match** for `powerd`/`powerdxx` (visible in `747d8ae^:src/monbsd.c:496-523`) —
+with `check_pid_file_liveness()` (`:494-507`): read an integer from a pidfile,
+`kill(pid, 0)`, treat `EPERM` as alive.
 
-**Current state.** `gather_data()` runs `nvidia-smi` synchronously every 5 ticks
-(`:615-648`); 100–300 ms subprocess latency stalls the 100 ms render loop.
+**Why it fails on FreeBSD.**
 
-**Design** (file-scope cache + atomics, same acquire/release idiom as pkg):
+1. **Permissions.** `powerd(8)` writes `/var/run/powerd.pid` mode `0600`
+   root:wheel (observed on this host). After the S1 privilege drop — and for
+   every non-root run — `fopen()` (`:495`) fails with `EACCES` and the
+   function returns 0. The `kill(pid,0)`/`EPERM` fallback is never even
+   reached, because the pid itself is unreadable. **This check cannot work
+   for the exact invocation modes S1 now mandates** (drop after open) nor for
+   the documented non-setuid install path. It only works for a process
+   running as root — which this program, by design, no longer is 100 ms after
+   startup.
+2. **powerdxx's pidfile is not guaranteed.** `/var/run/powerdxx.pid` does not
+   exist on this host; whether it exists at all depends on how powerdxx was
+   started (it is a ports package with its own rc integration, not base
+   `powerd(8)`). A pidfile-based check is fundamentally unreliable here.
+3. **PID recycling false positives.** Even when readable, the check validates
+   *liveness of a number*, not the process name. A recycled PID belonging to
+   an unrelated daemon reports `Running ✓`. The previous `ki_comm` exact
+   match had no such failure mode (and also avoided substring matches against
+   e.g. `upowerd`).
+4. **First-boot staleness.** The check runs at `tick_count % 20 == 0`
+   (`:658-661`) — i.e., immediately at tick 0 — fine — but a false result is
+   now *sticky for the whole session* because it never becomes readable later.
 
-```c
-struct nv_sample { float util; int mem_used, mem_total, temp; int valid; };
-static struct nv_sample g_nv_samples[MAX_GPUS];
-static int g_nv_samples_ready = 0;    /* atomic: release-store / acquire-load */
-static int g_nv_thread_running = 0;   /* atomic guard, like g_pkg_thread_running */
-```
+**Root cause summary:** an "optimization" replaced a correct, unprivileged,
+name-exact kernel query with a cheaper check that requires privileges the
+program deliberately relinquishes. The `KERN_PROC_ALL` cost it saved is one
+sysctl every 2 s — negligible.
 
-- `update_nvidia_thread()`: `popen_safe(NVIDIA_SMI_PATH, …)` into a *local* sample array
-  (parsing logic identical to today's sscanf loop), copy to `g_nv_samples`,
-  `__atomic_store_n(&g_nv_samples_ready, 1, __ATOMIC_RELEASE)`, then clear
-  `g_nv_thread_running` with release ordering.
-- `gather_data()`: when `has_nvidia_smi` && ≥1 NVIDIA GPU && `tick_count % 5 == 0` &&
-  not running → spawn detached pthread. Every tick, if `g_nv_samples_ready`
-  (acquire), map samples onto GPUs using the existing nth-NVIDIA-index logic (`:632-635`)
-  and populate `util_pct/vram_*/temp_c`.
-- Persistence change: sample application happens *every* tick from the cache, so GPU
-  fields no longer blank between probes (today they reset every 5 ticks at `:611-612`).
-- Sysctl fallbacks unchanged: `dev.nvidia.N.temperature` when the sample is invalid;
-  `dev.drm*/dev.drmn*` freq for non-NVIDIA (`:650-673`).
-- The one-shot `pciconf -lv` model scan (`:556-604`) stays synchronous: bounded, runs
-  once at startup.
-- fork-in-thread safety: `popen_safe()`'s child calls only async-signal-safe functions
-  (`close/dup2/open/setres*/execv/_exit`) before `execv` — same as the existing pkg
-  thread.
+#### R3b — Silent thermal/live-freq degradation when `cpuctl` is absent
 
-### C3 — freq_levels power suffix
+`/dev/cpuctl0` does not exist unless the `cpuctl(4)` module is loaded
+(absent on this host). Then `g_cpuctl_fd == -1`, `direct_cpu_temp()`
+(`:274-292`) falls back to `hw.acpi.thermal.tz0.temperature`, and
+`direct_cpu_live_freq()` (`:294-316`) falls back to `dev.cpu.0.freq`. These
+fallbacks are intentional and correct — but (a) the degradation is invisible
+to the user, and (b) if the ACPI thermal zone is also absent, temp renders
+`-1.0 °C` (`:291`, `:1063`) — an ugly artifact with no "N/A" handling.
+Restoration is: render-aware handling + documentation (`kldload cpuctl`,
+`cpuctl_load="YES"` in `loader.conf`), not new probe machinery.
 
-In `render_thermal_power_box()` (`:944-950`), after tokenizing each level:
+#### R3c — Battery minor defects
 
-```c
-char *slash = strchr(level, '/');
-if (slash != NULL) *slash = '\0';   /* strip "/power_mW" suffix */
-snprintf(l_buf, sizeof(l_buf), "%s MHz", level);
-```
-
-### C4 — Header centering
-
-`║ FreeBSD System Monitor ║` = 26 display columns; `╚` + 24×`═` + `╝` = 26.
-`render()` (`:999-1000`): change `(term_width - 24) / 2` → `(term_width - 26) / 2`
-on both lines.
-
-### C5 — Disk target dedup
-
-In `gather_data()` (`:778-790`), skip targets equal to any earlier target
-(covers `home_path == "/zroot"` etc.):
-
-```c
-for (int j = 0; j < 5; j++) {
-    if (targets[j][0] == '\0') continue;
-    int dup = 0;
-    for (int k = 0; k < j; k++)
-        if (strcmp(targets[j], targets[k]) == 0) { dup = 1; break; }
-    if (dup) continue;
-    …
-}
-```
-
-### C6 — Battery state bitmask
-
-`hw.acpi.battery.state` is a bitmask (bit0 discharging, bit1 charging, bit2 critical),
-not an enum. Replace `:537-541`:
-
-```c
-if (itmp == 0) {
-    strlcpy(d->bat_source, "AC Power", …); strlcpy(d->bat_state, "Full", …);
-} else {
-    strlcpy(d->bat_source, (itmp & 1) ? "Battery" : "AC Power", …);
-    if (itmp & 4)      strlcpy(d->bat_state, "Critical", …);
-    else if (itmp & 1) strlcpy(d->bat_state, "Discharging", …);
-    else if (itmp & 2) strlcpy(d->bat_state, "Charging", …);
-    else               strlcpy(d->bat_state, "Unknown", …);
-}
-```
-
-This removes the inverted `itmp == 7 → "AC Power"` nonsense (7 = discharging|charging|
-critical).
-
-### C7 — Exact ports-repository match
-
-`pkg query %r` prints one repository name per line. In `update_pkg_counts_thread()`
-(`:374-376`), replace the `strstr` with a trimmed exact compare:
-
-```c
-line[strcspn(line, "\r\n")] = '\0';
-char *p = line;
-while (isspace((unsigned char)*p)) p++;
-size_t L = strlen(p);
-while (L > 0 && isspace((unsigned char)p[L - 1])) p[--L] = '\0';
-if (strcmp(p, "local") == 0) count++;
-```
-
-### C8 + N3 — print_val() hardening
-
-`:802-816`. Two negative-precision edges:
-1. Truncation branch: `".." ` form requires `avail >= 4`; for `avail ∈ {1,2,3}` print a
-   bare truncation: `printf(" %.*s", avail - 1, val);` (`avail <= 0` already returns at
-   `:809`).
-2. N3: clamp the label: after `if (lbl_len > w - 6) lbl_len = w - 6;` add
-   `if (lbl_len < 0) lbl_len = 0;` (guards w=5..7).
-
-### L1 — isatty() guard
-
-In `main()`, after env scrub, before `enable_raw_mode()` (`:1070`):
-
-```c
-if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
-    fprintf(stderr, "monbsd: stdin and stdout must be a terminal\n");
-    exit(1);
-}
-```
-
-### L2 — Architecture guards
-
-- At the includes block (`:23-25`):
-  ```c
-  #if defined(__amd64__) || defined(__i386__)
-  #define MONBSD_X86 1
-  #include <machine/cpufunc.h>
-  #include <sys/ioccom.h>
-  #include <sys/cpuctl.h>
-  #else
-  #define MONBSD_X86 0
-  #endif
-  ```
-- Guard bodies: `direct_cpu_cores()` CPUID read (non-x86 → `return 1`);
-  `direct_cpu_temp()`/`direct_cpu_live_freq()` MSR blocks (non-x86 → sysctl/fallback);
-  `direct_pci_count()` port scan (non-x86 → `return -1`, rendered "N/A" per N4);
-  CPU-brand CPUID block in `gather_data()` (`:401-412`) (non-x86 → `hw.model` sysctl).
-- `g_cpuctl_fd`/`g_io_fd` opens in `main()` are harmless on non-x86 (fail → -1) but are
-  also guarded for clarity.
-- Docs: README Prerequisites + man page note that MSR temps, APERF/MPERF live frequency
-  and direct PCI counting require amd64/i386; other architectures build and run with
-  reduced telemetry.
-
-### L3 — Complete the half-merged SSID feature (fixes N1 compile blocker)
-
-Infrastructure exists (`ssid[64]` field `:57`, `g_ssid_cache` `:177`,
-`refresh_wifi_ssid()` `:180-203`) but is never called and never rendered.
-
-1. Add `#include <net/if_ieee80211.h>` after `<net/if.h>` (`:21`) for
-   `struct ieee80211req` / `IEEE80211_IOC_SSID` / `SIOCG80211`.
-2. Add small cache helpers: `ssid_cache_lookup(name)` / `ssid_cache_store(name, ssid)`
-   over `g_ssid_cache`.
-3. In the iface loop (`:697-702`): default `d->ifaces[i].ssid[0] = '\0'`; when
-   `is_wifi`, look up the cache; refresh via `refresh_wifi_ssid()` every 50 ticks or on
-   cache miss, then store and copy into `d->ifaces[i].ssid`. (The `SIOCG80211` ioctl is
-   a cheap in-kernel call — no subprocess — so inline refresh at 5 s cadence is fine.)
-4. Render (`:965` area): after the `IP:` line,
-   `if (d->ifaces[i].is_wifi && d->ifaces[i].ssid[0]) print_val(…, "SSID:", …);`
-
-### L4 + L6 — Makefile
-
-- **L6:** replace the GNU-style pattern rule (`Makefile:20-21`) with a portable
-  single-suffix rule — bmake treats `.c:` as a suffix transform, GNU make treats it as
-  equivalent to `%: %.c`; one rule covers both `tests/` and `benchmarks/`:
-  ```make
-  .SUFFIXES: .c
-  .c:
-  	${CC} ${CFLAGS} $< -o $@
-  ```
-- **L4 additions:**
-  ```make
-  BENCH_SRCS= benchmarks/bench.c benchmarks/bench_getifaddrs.c benchmarks/bench_opt.c
-  BENCH= $(BENCH_SRCS:.c=)
-
-  bench: ${BENCH}
-
-  check: tests
-  	@pass=0; skip=0; fail=0; \
-  	for t in ${TESTS}; do \
-  		printf '== %s: ' "$$t"; \
-  		./$$t; rc=$$?; \
-  		if [ $$rc -eq 0 ]; then pass=$$((pass+1)); echo ok; \
-  		elif [ $$rc -eq 77 ]; then skip=$$((skip+1)); echo SKIP; \
-  		else fail=$$((fail+1)); echo FAIL; fi; \
-  	done; \
-  	echo "pass=$$pass skip=$$skip fail=$$fail"; \
-  	[ $$fail -eq 0 ]
-
-  install-user: ${TARGET}
-  	@if [ -n "$$HOME" ]; then \
-  		mkdir -p "$$HOME/.local/bin"; \
-  		install -m 755 ${TARGET} "$$HOME/.local/bin/${TARGET}"; \
-  		echo "installed (no setuid: MSR/PCI telemetry limited)"; \
-  	else \
-  		echo "\$$HOME is not set or empty; skipping user install."; \
-  	fi
-  ```
-  Extend `clean` to remove `${BENCH}`; extend `.PHONY` with `bench check install-user`.
-- Patch `tests/test_pci.c` and `tests/test_aperf.c` to exit **77** (automake skip
-  convention) when `open()` of `/dev/io` resp. `/dev/cpuctl0` fails with
-  `EACCES`/`EPERM`/`ENOENT`; keep real failures as 1. (`test_cpuctl.c` is compile-only;
-  `test_statfs.c`/`test_uptime.c` need no privileges; `test_compile.c`/`test_cpuid.c`
-  are x86-only — document that `make check` is an x86 target, matching L2.)
-
-### L5 — statfs divide-by-zero
-
-`gather_data()` `:783-787`: only accept a match with `f_blocks > 0`:
-
-```c
-if (strcmp(fs[i].f_mntonname, targets[j]) == 0) {
-    if (fs[i].f_blocks > 0) {
-        …fill entry…
-        d->disk_count++;
-    }
-    break;
-}
-```
-
-### L7 — Documentation
-
-**`monbsd.8`:**
-- New `EXIT STATUS` section: `0` user quit (`q`/`Q`/Ctrl-C); `1` startup failure
-  (non-terminal stdin/stdout, environment sanitization failure, privilege-drop failure);
-  `128+signo` terminated by signal after terminal restoration.
-- New `ENVIRONMENT` section: `TERM` (validated against `[A-Za-z0-9._+-]`, max 64 chars,
-  re-injected after scrubbing), `PATH` (reset to a fixed system list), `SUDO_UID`
-  (consulted to resolve the invoking user's home directory when run via sudo); all other
-  variables are cleared via `clearenv()`.
-- Update `PRIVILEGES`: describe the open-then-drop model — setuid root is needed only to
-  open `/dev/cpuctl0` and `/dev/io` at startup; privileges are permanently dropped before
-  the UI starts; without them the tool runs with reduced telemetry.
-- Add architecture note (full telemetry on amd64/i386).
-- Bump `.Dd`.
-
-**`README.md`:** Prerequisites gain the amd64/i386 note + non-root degradation table;
-Installation documents `make install-user`; new short "Development" section documenting
-`make tests`, `make check`, `make bench`.
-
-**Housekeeping:** bump `VERSION` to `"0.1.1"` (`:34`) and add a CHANGELOG entry
-grouping fixes by review ID.
+- `hw.acpi.battery.life` sysctl result is discarded (`:680`); on machines
+  where it fails, `bat_life` keeps its previous (or zero-initialized) value
+  and the bar renders a bogus `0%`/`stale%` (`:1118`).
+- When `hw.acpi.battery.state` is absent (desktops without a BAT device), the
+  box shows `Source: AC Power`, `State: N/A`, **and a 0% bar** — the bar
+  should be suppressed when there is no battery.
+- The C6 bitmask decode itself (`:667-679`) is correct on FreeBSD
+  (`hw.acpi.battery.state`: bit0 discharging, bit1 charging, bit2 critical)
+  and matches observed behavior (`state=0`, `life=100` on AC →
+  `AC Power`/`Full`). No change needed there.
 
 ---
 
-## 3. Implementation sequence
+## 3. Restoration designs (FreeBSD-only)
 
-1. **Unblock the build** — S3 helper + L3 wiring (resolves N1). *Everything else depends on a compilable tree.*
-2. **S1** privilege lifecycle (+N2 O_CLOEXEC, +N4 "N/A"). Highest security impact; touches the same probes L2 guards will wrap — do S1 first, then L2 guards around the refactored bodies.
-3. **S2** signal handlers. Small, independent.
-4. **C2** nvidia thread. Largest self-contained change.
-5. **C1, C3–C8, L1, L5** — single-site edits, any order.
-6. **L2** arch guards.
-7. **L4/L6** Makefile + test skip patches.
-8. **L7** docs, CHANGELOG, version bump.
-9. **Verification** (below).
+### F1 — Restore the Ports count (fixes R2)
 
-## 4. Verification (requires approval to run make)
+**Location:** `update_pkg_counts_thread()` (`src/monbsd.c:421-453`), counter
+declarations (`:417-418`), renderer (`:1043-1046`), scheduler (`:583-598`).
 
-1. `make clean && make` — warning-free under `-Wall -Wextra` (clang, FreeBSD/amd64).
-2. `make check` as a normal user — hardware tests report SKIP (77), rest pass; then
-   `sudo make check` — all pass.
-3. `make bench` builds all three benchmarks.
-4. Runtime smoke (setuid install):
-   - CPU temp / live freq / PCI count still populate (proves cached-fd pattern works
-     after the drop).
-   - `kill -TERM <pid>` / `kill -HUP <pid>` → terminal restored (echo on, cursor
-     visible), shell reports exit status 143/129.
-   - Resize to ~20 columns → box borders intact (C8/N3).
-   - NVIDIA box updates without visible stutter (C2); ports count matches
-     `pkg query %r | grep -cx local` (C7).
-   - WiFi interface shows SSID line (L3).
-5. `make install-user` / `make uninstall-user` round-trip.
-6. Manual: build on arm64 hardware if available (L2 guards) — otherwise at minimum
-   `cc -fsyntax-only` with the x86 paths forced off via a scratch `-UMONBSD_X86` test
-   harness is *not* equivalent; treat arm64 build as a follow-up manual check.
+1. **Version-proof query format.** pkg's own error enumerates the valid
+   suffixes (`n`, `o`, `v`); the repository *name* is `%rn`. To remain
+   correct across pkg releases, attempt in order:
+   - `pkg query '%rn'` → repository name per package;
+   - on non-zero exit, retry once with the legacy bare `pkg query '%r'`.
+   Keep the C7 exact, trimmed `strcmp(p, "local")` match — it is correct.
+2. **Gate stores on exit status.** For *both* pkg probes, only
+   `__atomic_store_n()` when `pclose_safe()` returns `0`. A failed probe must
+   leave the last-known value intact.
+3. **Introduce an "unknown" state.** Initialize `g_pkg_count` and
+   `g_ports_count` to `-1`; render `N/A` (matching the PCI N/A idiom) while
+   negative. Distinguishes "query broken" from "genuinely zero".
+4. **Cadence.** Keep the #36 thread pattern, but reduce the refresh from
+   3000 to **600 ticks (~60 s)**: cheap (two short-lived subprocesses per
+   minute, off the render path) and bounds error visibility. Store-gating
+   (step 2) makes the cadence argument moot for correctness; this is for
+   freshness only.
+5. **Docs.** `monbsd.8`: state that "Ports" counts packages whose pkg
+   repository name is exactly `local` (ports-tree installs); poudriere/synth
+   builds report their own repository names and are not counted.
 
-## 5. Risks and mitigations
+### F2 — Restore the PCI device count (fixes R1)
+
+**Location:** `direct_pci_count()` (`:318-346`), cache site (`:608-615`),
+renderer (`:1040-1041`), `main()` opens (`:1250-1256`).
+
+1. **Add an unprivileged, arch-neutral enumerator.** New helper
+   `pciconf_pci_count()`: `popen_safe("/usr/sbin/pciconf", {"pciconf","-l"})`,
+   count non-empty output lines, exit-status-gated (F1 step 2 pattern),
+   return `-1` on failure. `pciconf(8)` is base-system, readable by any user,
+   and works on every FreeBSD architecture (x86, arm64, riscv, powerpc).
+2. **Probe order.** Rename/keep the entry point as the single PCI source:
+   - x86 with `g_io_fd >= 0` → direct CF8/CFC scan (fast, no subprocess);
+   - otherwise → `pciconf_pci_count()`;
+   - both fail → `-1` → render `N/A` (existing N4 idiom).
+3. **Keep the S1 model unchanged.** `/dev/io` is still opened once pre-drop
+   with `O_CLOEXEC`; the setuid install keeps the fast path. Non-root and
+   `install-user` runs now get a *correct* count via pciconf instead of N/A.
+4. **Semantics note.** The port scan counts config-space functions;
+   `pciconf -l` lists one line per enumerated device/function. Counts are
+   comparable in magnitude but may differ slightly (bridges, hot-plug
+   visibility) — the metric is "devices on the PCI bus", and pciconf is the
+   authoritative FreeBSD view of it. Document in the man page.
+5. **(Optional, later)** Fold the count into the existing one-shot
+   `pciconf -lv` GPU scan (`:696-738`) so the PCI count and GPU models come
+   from a single subprocess at startup; refresh at the existing
+   `tick_count % 100` cadence. Defer unless desired — correctness first.
+
+### F3 — Restore power telemetry (fixes R3a/R3b/R3c)
+
+**Location:** `check_pid_file_liveness()` (`:494-507`), powerd block
+(`:655-664`), battery block (`:666-680`), battery render (`:1116-1119`),
+temp render (`:1063`).
+
+1. **F3a — revert to the name-exact kernel scan.** Delete
+   `check_pid_file_liveness()` and restore the pre-`747d8ae` implementation
+   (proven correct on this codebase): every 20 ticks, `sysctl` `CTL_KERN /
+   KERN_PROC / KERN_PROC_ALL`, iterate `struct kinfo_proc`, set
+   `cached_powerd` / `cached_powerdxx` on exact `strcmp(ki_comm, "powerd")` /
+   `strcmp(ki_comm, "powerdxx") == 0`. Properties:
+   - unprivileged under the FreeBSD default (`security.bsd.see_other_uids=1`);
+   - no subprocess, no pidfile, no permissions failure mode after the S1 drop;
+   - exact-name match: no PID-recycle false positives, no `upowerd`
+     substring matches;
+   - cost: one sysctl every 2 s.
+   Caveat to document: with `security.bsd.see_other_uids=0`, a non-root
+   monbsd cannot see root's daemons; in that configuration the previous
+   pidfile check is *also* useless (0600), so nothing is lost — the UI will
+   show `Stopped ✗`, which the man page will explain. (Optional refinement:
+   if the sysctl succeeds but finds neither name, *and* the pidfile is
+   readable, fall back to the pidfile liveness check. Only add if a real
+   configuration demands it.)
+2. **F3b — render-aware thermal degradation.** If `direct_cpu_temp()`
+   returns `< 0`, render `N/A` instead of `-1.0 °C`. Document in `monbsd.8`
+   and `README.md` that MSR temps / APERF-MPERF live frequency require
+   `kldload cpuctl` (and the setuid install); otherwise ACPI thermal zone and
+   `dev.cpu.0.freq` are used, and where those are absent the fields show
+   `N/A`.
+3. **F3c — battery correctness.**
+   - Check the `hw.acpi.battery.life` sysctl result; on failure set
+     `d->bat_life = -1`.
+   - Track battery presence: `has_battery = (sysctl(hw.acpi.battery.state)
+     succeeded)`. When absent: `Source: AC Power`, `State: No battery`, and
+     **skip the Bat bar** (`:1118`) or render `N/A`. When present but life
+     unknown (`-1`), skip just the bar.
+
+### F4 — Hygiene (H1 + fallout)
+
+1. **H1:** `git rm --cached monbsd`; delete the file; add `.gitignore`
+   covering `/monbsd`, `/tests/test_*` binaries, `/benchmarks/bench*`
+   binaries. The Makefile already builds all of these from source.
+2. **H2 (generalized F1-step-2):** audit every `pclose_safe()` call site
+   (`:431`, `:447`, `:486`, `:738`, `:911`) — pkg, nvidia-smi, pciconf,
+   swapinfo — and only commit parsed results on exit status `0`. (swapinfo
+   already gates its cache at `:911`; make the others match.)
+3. **Docs:** `monbsd.8` and `README.md` gain a "Telemetry sources and
+   privileges" table (below); CHANGELOG `[0.1.2]` entry; bump `VERSION` to
+   `"0.1.2"` (`:41`).
+
+---
+
+## 4. Findings matrix (this plan)
+
+| ID | Symptom | Root cause | Fix | Effort | Risk |
+|----|---------|------------|-----|--------|------|
+| R1 | `PCI Devices: N/A` | `/dev/io` root-only; no unprivileged fallback | F2: pciconf fallback | Low | Low |
+| R2 | `Ports: 0 built` | pkg rejects bare `%r`; store not gated on exit status; 5-min stickiness | F1: `%rn`+legacy retry, gate stores, `-1`=N/A, 600-tick cadence | Low | Low |
+| R3a | powerd/powerdxx `Stopped ✗` | #37 pidfile check vs 0600 root pidfile + S1 drop; no name match; powerdxx pidfile unreliable | F3a: restore `KERN_PROC` exact-name scan | Low | Low |
+| R3b | `-1.0 °C` / silent temp-freq degradation | cpuctl module absent; no render handling for `-1` | F3b: N/A rendering + docs | Trivial | None |
+| R3c | Bogus battery bar on battery-less/ACPI-less hosts | `battery.life` result ignored; bar unconditional | F3c: presence flag + `-1` handling | Trivial | None |
+| H1 | Stale committed binary at repo root | `eb2af17` added `monbsd` to git | F4.1: remove + `.gitignore` | Trivial | None |
+| H2 | Failed subprocesses overwrite good data | `pclose_safe()` statuses unchecked | F4.2: gate all parse stores | Low | Low |
+
+---
+
+## 5. Implementation sequence
+
+1. **F3a** (powerd revert) — highest user-visible impact, self-contained.
+2. **F1** (ports) — query format, store gating, `-1` init, cadence, renderer.
+3. **F2** (PCI) — pciconf fallback + probe order.
+4. **F3b/F3c** (thermal render, battery) — small, independent.
+5. **F4** (hygiene: binary removal, `.gitignore`, pclose audit, docs,
+   CHANGELOG, version bump to 0.1.2).
+6. Verification per §6.
+
+Order rationale: 1–3 are the three reported regressions; each is an
+independent single-site change with no cross-dependencies.
+
+---
+
+## 6. Verification (FreeBSD, requires approval to run make)
+
+1. `make clean && make` — warning-free under `-Wall -Wextra`.
+2. `make check` as a normal user (hardware tests SKIP with 77), then
+   `sudo make check`.
+3. Runtime smoke, **as a normal (non-root) user** — the configuration where
+   all three regressions manifest:
+   - `PCI Devices:` shows a number matching `pciconf -l | wc -l` (± bridge
+     semantics), not `N/A`.
+   - `Ports:` matches `pkg query '%rn' | grep -cx local`; with pkg
+     deliberately made to fail (e.g., `PATH`-shadowed bogus pkg in a scratch
+     test) the counter holds its last value / shows `N/A`, never a false `0`.
+   - `service powerd onestart` → UI shows `powerd: Running ✓` within ~2 s;
+     `service powerd onestop` → `Stopped ✓`. Same for powerdxx if installed.
+   - Battery-less host: no `0%` bar; `State: No battery` (or `N/A`).
+   - With `kldunload cpuctl` (if loaded): temp shows ACPI value or `N/A`,
+     never `-1.0 °C`.
+4. Runtime smoke, **setuid install** (`sudo make install`): direct port scan
+   path confirmed (PCI count present), MSR temp/live-freq present when
+   cpuctl is loaded, and all non-root results above remain correct — the two
+   privilege paths must agree.
+5. `make install-user` / `make uninstall-user` round-trip; confirm the
+   install message matches the new telemetry table (PCI now works
+   unprivileged via pciconf).
+6. Confirm `git status` shows no tracked binaries; `make clean` leaves the
+   tree pristine.
+
+---
+
+## 7. Telemetry sources & privileges (to be documented in `monbsd.8`/`README.md`)
+
+| Field | Source | Root/setuid needed? | Degradation |
+|-------|--------|---------------------|-------------|
+| CPU temp | MSR via `/dev/cpuctl0` (cached fd) → ACPI `hw.acpi.thermal.tz0.temperature` | Only for MSR path | ACPI value, else `N/A` |
+| Live freq | APERF/MPERF via `/dev/cpuctl0` → `dev.cpu.0.freq` | Only for MSR path | sysctl value |
+| PCI devices | CF8/CFC scan via `/dev/io` (cached fd) → **`pciconf -l`** (new) | Only for direct scan | pciconf count (equal standing), else `N/A` |
+| Ports/pkg | `pkg info -q`, `pkg query '%rn'` (thread, exit-gated) | No | `N/A` on query failure |
+| powerd/powerdxx | `KERN_PROC_ALL` exact `ki_comm` match | No (default `see_other_uids=1`) | `Stopped ✗` + man-page caveat |
+| Battery | `hw.acpi.battery.{state,life}` | No | `No battery` / bar suppressed |
+| GPU | `pciconf -lv` (once), `nvidia-smi` (thread), `dev.nvidia.*`/`dev.drm.*` sysctls | No | Partial fields |
+| Disks/swap | `getfsstat`, `swapinfo -k` (cached 50 ticks) | No | Full |
+| Network/SSID | `ifmibdata` sysctl, `getifaddrs`, `SIOCG80211` ioctl | No | Full |
+
+---
+
+## 8. Risks and mitigations
 
 | Risk | Mitigation |
 |------|------------|
-| RDMSR/inl/outl silently fail post-drop on some FreeBSD version | Graceful fallbacks already exist (ACPI thermal, `dev.cpu.0.freq`, PCI "N/A"); smoke test per §4.4 confirms |
-| nvidia thread races on sample array | Local array in thread → single release-store of ready flag; acquire-load by reader; reader copies before use |
-| `check` runner flags permission failures as failures | Exit-77 skip convention in the two hardware tests |
-| Behavior change: "Cores" → "Threads" label | Documented in CHANGELOG; value semantics now honest |
-| SSID ioctl unsupported on non-802.11 `wlan*` names | `refresh_wifi_ssid()` already fails soft (empty string → line hidden) |
+| `%rn` unsupported on some older pkg | Legacy bare-`%r` retry preserves prior behavior; worst case equals today's failure, now rendered honestly as `N/A` |
+| `pciconf -l` count differs slightly from port-scan count | Documented semantics (§3.2 step 4); direct scan retained as primary on x86+root so setuid installs see no change |
+| `KERN_PROC_ALL` overhead concern (the original #37 motivation) | One sysctl per 2 s (20-tick cadence retained); measured cost trivial vs. the per-tick render work |
+| `security.bsd.see_other_uids=0` hardening hides powerd from non-root | Man-page caveat; pidfile method was equally broken there (0600), so no regression vs. any prior state |
+| Behavior change: Ports/pkg can now show `N/A` | CHANGELOG entry; honest unknown-state beats false `0` |

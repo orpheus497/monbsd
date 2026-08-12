@@ -1,0 +1,6 @@
+# Build artifacts
+/monbsd
+/tests/test_*
+!/tests/test_*.c
+/benchmarks/bench*
+!/benchmarks/bench*.c

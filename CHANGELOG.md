@@ -2,6 +2,38 @@
 
 All notable changes to `monbsd` will be documented in this file.
 
+## [0.1.2] - 2026-08-12
+
+Regression restoration release. IDs reference PLAN.md (R = regression,
+F = fix, H = hygiene).
+
+### Fixed
+- **R1/F2:** PCI device count no longer reports "N/A" for non-root runs:
+  when the direct `/dev/io` configuration-space scan is unavailable the
+  count falls back to `pciconf -l`, which works for any user on any
+  FreeBSD architecture.
+- **R2/F1:** Ports count stuck at 0: current pkg rejects the bare `%r`
+  query format, and the failed query silently overwrote the count. The
+  repository name is now queried as `%rn` (with a legacy `%r` retry),
+  results are only stored when `pkg` exits successfully, and both pkg
+  counters render "N/A" until a query succeeds.
+- **R3a/F3a:** powerd/powerdxx always showed "Stopped": detection read
+  `/var/run/*.pid` (mode 0600, root-owned), unreadable after the privilege
+  drop. Reverted to an exact-name `kern.proc` sysctl scan — no subprocess,
+  unprivileged, immune to PID recycling.
+- **F3b:** CPU temperature renders "N/A" instead of "-1.0 °C" when neither
+  MSR (`cpuctl`) nor ACPI thermal zone telemetry exists.
+- **F3c:** Battery charge reads are validated (a failed
+  `hw.acpi.battery.life` read no longer shows a stale/0% bar); hosts
+  without an ACPI battery report "No battery" and hide the charge bar.
+- **H2:** nvidia-smi, pciconf (GPU scan) and pkg probe results are only
+  committed when the subprocess exits successfully.
+
+### Changed
+- pkg/ports refresh cadence is ~60 s (600 ticks) instead of ~5 min.
+- The compiled `monbsd` binary is no longer tracked in git; build
+  artifacts are covered by `.gitignore`.
+
 ## [0.1.1] - 2026-08-12
 
 Code review remediation release. IDs reference the v0.1.0 review findings

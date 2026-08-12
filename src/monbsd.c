@@ -38,7 +38,7 @@
 #include <pthread.h>
 #include <sys/wait.h>
 
-#define VERSION "0.1.1"
+#define VERSION "0.1.2"
 #define HISTORY_SIZE 10
 #define MAX_DISKS 8
 #define MAX_NET_IF 4
@@ -103,6 +103,7 @@ struct mon_data {
     char bat_source[32];
     int bat_life;
     char bat_state[32];
+    int has_battery;
     char freq_levels[1024];
 
     struct gpu_data gpus[MAX_GPUS];
@@ -315,34 +316,38 @@ double direct_cpu_live_freq(double fallback_freq, double base_freq) {
     return fallback_freq;
 }
 
+static int pciconf_pci_count(void);
+
 int direct_pci_count() {
 #if MONBSD_X86
-    if (g_io_fd < 0) return -1;
-    int count = 0;
-    for (int bus = 0; bus < 256; bus++) {
-        for (int dev = 0; dev < 32; dev++) {
-            uint32_t address = (1 << 31) | (bus << 16) | (dev << 11) | 0;
-            outl(0xCF8, address);
-            uint32_t val = inl(0xCFC);
-            if (val != 0xFFFFFFFF && val != 0) {
-                count++;
-                outl(0xCF8, address | 0x0C);
-                uint32_t hdr = inl(0xCFC);
-                if (hdr & 0x00800000) {
-                    for (int func = 1; func < 8; func++) {
-                        address = (1 << 31) | (bus << 16) | (dev << 11) | (func << 8);
-                        outl(0xCF8, address);
-                        val = inl(0xCFC);
-                        if (val != 0xFFFFFFFF && val != 0) count++;
+    if (g_io_fd >= 0) {
+        int count = 0;
+        for (int bus = 0; bus < 256; bus++) {
+            for (int dev = 0; dev < 32; dev++) {
+                uint32_t address = (1 << 31) | (bus << 16) | (dev << 11) | 0;
+                outl(0xCF8, address);
+                uint32_t val = inl(0xCFC);
+                if (val != 0xFFFFFFFF && val != 0) {
+                    count++;
+                    outl(0xCF8, address | 0x0C);
+                    uint32_t hdr = inl(0xCFC);
+                    if (hdr & 0x00800000) {
+                        for (int func = 1; func < 8; func++) {
+                            address = (1 << 31) | (bus << 16) | (dev << 11) | (func << 8);
+                            outl(0xCF8, address);
+                            val = inl(0xCFC);
+                            if (val != 0xFFFFFFFF && val != 0) count++;
+                        }
                     }
                 }
             }
         }
+        return count;
     }
-    return count;
-#else
-    return -1;
 #endif
+    /* Unprivileged, arch-neutral fallback: pciconf(8) enumerates PCI
+     * devices for any user on any FreeBSD architecture. */
+    return pciconf_pci_count();
 }
 
 static int count_dir_executables(const char *path) {
@@ -414,8 +419,24 @@ static int pclose_safe(FILE *fp, pid_t pid) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-static int g_pkg_count = 0;
-static int g_ports_count = 0;
+/* Count PCI devices via pciconf(8): one output line per enumerated
+ * device/function. Unprivileged and architecture-neutral; used when the
+ * direct /dev/io port scan is unavailable. Returns -1 on failure. */
+static int pciconf_pci_count(void) {
+    pid_t p_pid;
+    char *pciconf_argv[] = {"pciconf", "-l", NULL};
+    FILE *fp = popen_safe("/usr/sbin/pciconf", pciconf_argv, &p_pid);
+    if (fp == NULL) return -1;
+    int count = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), fp))
+        if (line[0] != '\n' && line[0] != '\0') count++;
+    if (pclose_safe(fp, p_pid) != 0) return -1;
+    return count;
+}
+
+static int g_pkg_count = -1;    /* -1 = no successful query yet (rendered N/A) */
+static int g_ports_count = -1;
 static int g_pkg_thread_running = 0;
 
 static void *update_pkg_counts_thread(void *arg) {
@@ -427,12 +448,18 @@ static void *update_pkg_counts_thread(void *arg) {
         int count = 0;
         char line[256];
         while (fgets(line, sizeof(line), fp)) count++;
-        __atomic_store_n(&g_pkg_count, count, __ATOMIC_RELAXED);
-        pclose_safe(fp, p_pid);
+        if (pclose_safe(fp, p_pid) == 0)
+            __atomic_store_n(&g_pkg_count, count, __ATOMIC_RELAXED);
     }
-    char *pkg_query_argv[] = {"pkg", "query", "%r", NULL};
-    fp = popen_safe("/usr/local/sbin/pkg", pkg_query_argv, &p_pid);
-    if (fp) {
+    /* Current pkg requires a suffix on the repository format ('%rn');
+     * older releases accepted the bare '%r'. Try the modern form first,
+     * retry once with the legacy form on non-zero exit, and only store on
+     * success so a failed query never overwrites a last-known-good count. */
+    const char *repo_fmts[] = {"%rn", "%r"};
+    for (size_t a = 0; a < sizeof(repo_fmts) / sizeof(repo_fmts[0]); a++) {
+        char *pkg_query_argv[] = {"pkg", "query", (char *)repo_fmts[a], NULL};
+        fp = popen_safe("/usr/local/sbin/pkg", pkg_query_argv, &p_pid);
+        if (fp == NULL) break;
         int count = 0;
         char line[256];
         while (fgets(line, sizeof(line), fp)) {
@@ -443,8 +470,10 @@ static void *update_pkg_counts_thread(void *arg) {
             while (L > 0 && isspace((unsigned char)p[L - 1])) p[--L] = '\0';
             if (strcmp(p, "local") == 0) count++;
         }
-        __atomic_store_n(&g_ports_count, count, __ATOMIC_RELAXED);
-        pclose_safe(fp, p_pid);
+        if (pclose_safe(fp, p_pid) == 0) {
+            __atomic_store_n(&g_ports_count, count, __ATOMIC_RELAXED);
+            break;
+        }
     }
 
     // Ensure memory is visibly updated before clearing the flag
@@ -483,27 +512,13 @@ static void *update_nvidia_thread(void *arg) {
                 nv_line++;
             }
         }
-        pclose_safe(fp, p_pid);
-        memcpy(g_nv_samples, local, sizeof(g_nv_samples));
-        __atomic_store_n(&g_nv_samples_ready, 1, __ATOMIC_RELEASE);
+        if (pclose_safe(fp, p_pid) == 0) {
+            memcpy(g_nv_samples, local, sizeof(g_nv_samples));
+            __atomic_store_n(&g_nv_samples_ready, 1, __ATOMIC_RELEASE);
+        }
     }
     __atomic_store_n(&g_nv_thread_running, 0, __ATOMIC_RELEASE);
     return NULL;
-}
-
-static int check_pid_file_liveness(const char *pid_file) {
-    FILE *fp = fopen(pid_file, "r");
-    if (!fp) return 0;
-
-    int pid = 0;
-    if (fscanf(fp, "%d", &pid) == 1 && pid > 0) {
-        if (kill(pid, 0) == 0 || errno == EPERM) {
-            fclose(fp);
-            return 1;
-        }
-    }
-    fclose(fp);
-    return 0;
 }
 
 void gather_data(struct mon_data *d) {
@@ -582,7 +597,7 @@ void gather_data(struct mon_data *d) {
 
     static int pkg_ticks = 0;
     if (pkg_ticks-- <= 0) {
-        pkg_ticks = 3000;
+        pkg_ticks = 600;
 
         if (__atomic_load_n(&g_pkg_thread_running, __ATOMIC_ACQUIRE) == 0) {
             __atomic_store_n(&g_pkg_thread_running, 1, __ATOMIC_RELEASE);
@@ -656,8 +671,37 @@ void gather_data(struct mon_data *d) {
     static int cached_powerdxx = 0;
 
     if (tick_count % 20 == 0) {
-        cached_powerd = check_pid_file_liveness("/var/run/powerd.pid");
-        cached_powerdxx = check_pid_file_liveness("/var/run/powerdxx.pid");
+        /* Name-exact process scan via the kern.proc sysctl: unprivileged
+         * under the default security.bsd.see_other_uids=1, immune to pidfile
+         * permissions and PID recycling, and matches only "powerd"/"powerdxx"
+         * exactly. */
+        int mib[3];
+        size_t len;
+        struct kinfo_proc *kp;
+
+        mib[0] = CTL_KERN;
+        mib[1] = KERN_PROC;
+        mib[2] = KERN_PROC_ALL;
+
+        if (sysctl(mib, 3, NULL, &len, NULL, 0) == 0) {
+            len = len * 4 / 3; /* Allocate extra buffer to prevent race conditions */
+            kp = malloc(len);
+            if (kp != NULL) {
+                if (sysctl(mib, 3, kp, &len, NULL, 0) == 0) {
+                    int found_powerd = 0;
+                    int found_powerdxx = 0;
+                    int nproc = len / sizeof(struct kinfo_proc);
+                    for (int i = 0; i < nproc; i++) {
+                        if (strcmp(kp[i].ki_comm, "powerd") == 0) found_powerd = 1;
+                        else if (strcmp(kp[i].ki_comm, "powerdxx") == 0) found_powerdxx = 1;
+                        if (found_powerd && found_powerdxx) break;
+                    }
+                    cached_powerd = found_powerd;
+                    cached_powerdxx = found_powerdxx;
+                }
+                free(kp);
+            }
+        }
     }
 
     d->powerd_running = cached_powerd;
@@ -665,6 +709,7 @@ void gather_data(struct mon_data *d) {
 
     size = sizeof(itmp);
     if (sysctlbyname("hw.acpi.battery.state", &itmp, &size, NULL, 0) == 0) {
+        d->has_battery = 1;
         /* hw.acpi.battery.state is a bitmask: bit0 discharging, bit1 charging, bit2 critical */
         if (itmp == 0) {
             strlcpy(d->bat_source, "AC Power", sizeof(d->bat_source));
@@ -676,8 +721,15 @@ void gather_data(struct mon_data *d) {
             else if (itmp & 2) strlcpy(d->bat_state, "Charging", sizeof(d->bat_state));
             else               strlcpy(d->bat_state, "Unknown", sizeof(d->bat_state));
         }
-    } else { strlcpy(d->bat_source, "AC Power", sizeof(d->bat_source)); strlcpy(d->bat_state, "N/A", sizeof(d->bat_state)); }
-    size = sizeof(d->bat_life); sysctlbyname("hw.acpi.battery.life", &d->bat_life, &size, NULL, 0);
+        size = sizeof(d->bat_life);
+        if (sysctlbyname("hw.acpi.battery.life", &d->bat_life, &size, NULL, 0) != 0)
+            d->bat_life = -1;
+    } else {
+        d->has_battery = 0;
+        d->bat_life = -1;
+        strlcpy(d->bat_source, "AC Power", sizeof(d->bat_source));
+        strlcpy(d->bat_state, "No battery", sizeof(d->bat_state));
+    }
 
     size = sizeof(d->freq_levels);
     if (sysctlbyname("dev.cpu.0.freq_levels", d->freq_levels, &size, NULL, 0) == 0)
@@ -735,7 +787,8 @@ void gather_data(struct mon_data *d) {
                         }
                     }
                 }
-                pclose_safe(fp, p_pid);
+                if (pclose_safe(fp, p_pid) != 0)
+                    g_cached_count = 0;   /* discard partial scan on failure */
             }
             if (has_nvidia_smi < 0) {
                 has_nvidia_smi = (access(NVIDIA_SMI_PATH, X_OK) == 0) ? 1 : 0;
@@ -1040,9 +1093,11 @@ static void render_system_box(struct mon_data *d, int box_top, int box_bot, int 
     if (d->pci_device_count >= 0) snprintf(buf, sizeof(buf), "%d devices", d->pci_device_count);
     else strlcpy(buf, "N/A", sizeof(buf));
     if (r < box_bot) print_val(r++, 3, col_w - 4, "PCI Devices:", buf);
-    snprintf(buf, sizeof(buf), "%d installed", d->pkg_count);
+    if (d->pkg_count >= 0) snprintf(buf, sizeof(buf), "%d installed", d->pkg_count);
+    else strlcpy(buf, "N/A", sizeof(buf));
     if (r < box_bot) print_val(r++, 3, col_w - 4, "pkg Packages:", buf);
-    snprintf(buf, sizeof(buf), "%d built", d->ports_count);
+    if (d->ports_count >= 0) snprintf(buf, sizeof(buf), "%d built", d->ports_count);
+    else strlcpy(buf, "N/A", sizeof(buf));
     if (r < box_bot) print_val(r++, 3, col_w - 4, "Ports:", buf);
     snprintf(buf, sizeof(buf), "%d program(s)", d->linux_count);
     if (r < box_bot) print_val(r++, 3, col_w - 4, "Linux Compat:", buf);
@@ -1060,7 +1115,8 @@ static void render_thermal_power_box(struct mon_data *d, int box_top, int box_bo
     char buf[256];
     int r = box_top + 2;
     if (r < box_bot) draw_heading(r++, c2x + 2, c2inner, 36, "THERMAL");
-    snprintf(buf, sizeof(buf), "%.1f °C", d->cpu_temp);
+    if (d->cpu_temp >= 0) snprintf(buf, sizeof(buf), "%.1f °C", d->cpu_temp);
+    else strlcpy(buf, "N/A", sizeof(buf));
     if (r < box_bot) print_val(r++, c2x + 2, c2inner, "CPU Temp:", buf);
     if (r < box_bot) print_val(r++, c2x + 2, c2inner, "State:", d->thermal_state);
     snprintf(buf, sizeof(buf), "%.0f MHz (%c)", d->live_freq_mhz, d->freq_trend > 0 ? '+' : (d->freq_trend < 0 ? '-' : '='));
@@ -1115,7 +1171,8 @@ static void render_thermal_power_box(struct mon_data *d, int box_top, int box_bo
     r++;
     if (r < box_bot) draw_heading(r++, c2x + 2, c2inner, 36, "BATTERY");
     if (r < box_bot) print_val(r++, c2x + 2, c2inner, "Source:", d->bat_source);
-    if (r < box_bot) print_bar(r++, c2x + 2, c2inner, (double)d->bat_life, "Bat");
+    if (d->has_battery && d->bat_life >= 0 && r < box_bot)
+        print_bar(r++, c2x + 2, c2inner, (double)d->bat_life, "Bat");
     if (r < box_bot) print_val(r++, c2x + 2, c2inner, "State:", d->bat_state);
     r++;
     if (r < box_bot) draw_heading(r++, c2x + 2, c2inner, 36, "FREQ RANGE");
