@@ -38,10 +38,10 @@ at startup.
 The following variables are honored or re-injected:
 .Bl -tag -width "SUDO_UID"
 .It Ev TERM
-Validated against the character set
-.Va [A-Za-z0-9._+-]
-(maximum 64 characters) and re-injected after scrubbing; invalid values are
-discarded.
+The first 64 bytes are validated against the character set
+.Va [A-Za-z0-9._+-] .
+Values are truncated to 64 characters before being re-injected after
+scrubbing; invalid values are discarded.
 .It Ev PATH
 Reset to a fixed system list
 .Pq /bin:/usr/bin:/sbin:/usr/sbin:/usr/local/sbin:/usr/local/bin .

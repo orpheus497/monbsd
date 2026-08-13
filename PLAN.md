@@ -304,8 +304,14 @@ temp render (`:1063`).
 ### F4 — Hygiene (H1 + fallout)
 
 1. **H1:** `git rm --cached monbsd`; delete the file; add `.gitignore`
-   covering `/monbsd`, `/tests/test_*` binaries, `/benchmarks/bench*`
-   binaries. The Makefile already builds all of these from source.
+   covering `/monbsd` (the compiled binary), exact test binary paths
+   (`/tests/test_aperf`, `/tests/test_compile`, `/tests/test_cpuctl`,
+   `/tests/test_cpuid`, `/tests/test_pci`, `/tests/test_statfs`,
+   `/tests/test_uptime`) and benchmark binaries
+   (`/benchmarks/bench_cpuid`, `/benchmarks/bench_getifaddrs`,
+   `/benchmarks/bench_opt`, `/benchmarks/bench_sysctl`, `/benchmarks/bench`)
+   — patterns must not match `.c` source files.
+   The Makefile already builds all of these from source.
 2. **H2 (generalized F1-step-2):** audit every `pclose_safe()` call site
    (`:431`, `:447`, `:486`, `:738`, `:911`) — pkg, nvidia-smi, pciconf,
    swapinfo — and only commit parsed results on exit status `0`. (swapinfo
@@ -340,8 +346,9 @@ temp render (`:1063`).
    CHANGELOG, version bump to 0.1.2).
 6. Verification per §6.
 
-Order rationale: 1–3 are the three reported regressions; each is an
-independent single-site change with no cross-dependencies.
+Order rationale: 1–3 are the three reported regressions and have separate
+root causes, but each requires coordinated validation across producers,
+caches, renderers, and relevant startup or scheduling paths.
 
 ---
 
@@ -382,7 +389,7 @@ independent single-site change with no cross-dependencies.
 | Live freq | APERF/MPERF via `/dev/cpuctl0` → `dev.cpu.0.freq` | Only for MSR path | sysctl value |
 | PCI devices | CF8/CFC scan via `/dev/io` (cached fd) → **`pciconf -l`** (new) | Only for direct scan | pciconf count (equal standing), else `N/A` |
 | Ports/pkg | `pkg info -q`, `pkg query '%rn'` (thread, exit-gated) | No | `N/A` on query failure |
-| powerd/powerdxx | `KERN_PROC_ALL` exact `ki_comm` match | No (default `see_other_uids=1`) | `Stopped ✗` + man-page caveat |
+| powerd/powerdxx | `KERN_PROC_ALL` exact `ki_comm` match | No (default `see_other_uids=1`) | `Stopped ✗` when `security.bsd.see_other_uids=0` hides root-owned processes from non-root users; man-page caveat |
 | Battery | `hw.acpi.battery.{state,life}` | No | `No battery` / bar suppressed |
 | GPU | `pciconf -lv` (once), `nvidia-smi` (thread), `dev.nvidia.*`/`dev.drm.*` sysctls | No | Partial fields |
 | Disks/swap | `getfsstat`, `swapinfo -k` (cached 50 ticks) | No | Full |

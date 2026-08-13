@@ -22,6 +22,7 @@
 #include <net/if_mib.h>
 #include <net80211/ieee80211_ioctl.h>
 #include <sys/vmmeter.h>
+#include <dev/acpica/acpiio.h>
 #if defined(__amd64__) || defined(__i386__)
 #define MONBSD_X86 1
 #include <machine/cpufunc.h>
@@ -490,6 +491,10 @@ struct nv_sample { float util; int mem_used, mem_total, temp; int valid; };
 static struct nv_sample g_nv_samples[MAX_GPUS];
 static int g_nv_samples_ready = 0;    /* atomic: release-store / acquire-load */
 static int g_nv_thread_running = 0;   /* atomic guard, like g_pkg_thread_running */
+static pthread_mutex_t g_nv_samples_mutex = PTHREAD_MUTEX_INITIALIZER;
+static unsigned int g_nv_samples_tick = 0;
+static char g_privileged_note[128];
+static int g_privileged_note_visible = 0;
 
 static void *update_nvidia_thread(void *arg) {
     (void)arg;
@@ -518,9 +523,25 @@ static void *update_nvidia_thread(void *arg) {
             }
         }
         if (pclose_safe(fp, p_pid) == 0) {
+            unsigned int sample_tick = __atomic_load_n(&tick_count, __ATOMIC_ACQUIRE);
+            pthread_mutex_lock(&g_nv_samples_mutex);
             memcpy(g_nv_samples, local, sizeof(g_nv_samples));
+            g_nv_samples_tick = sample_tick;
+            pthread_mutex_unlock(&g_nv_samples_mutex);
             __atomic_store_n(&g_nv_samples_ready, 1, __ATOMIC_RELEASE);
+        } else {
+            pthread_mutex_lock(&g_nv_samples_mutex);
+            memset(g_nv_samples, 0, sizeof(g_nv_samples));
+            g_nv_samples_tick = 0;
+            pthread_mutex_unlock(&g_nv_samples_mutex);
+            __atomic_store_n(&g_nv_samples_ready, 0, __ATOMIC_RELEASE);
         }
+    } else {
+        pthread_mutex_lock(&g_nv_samples_mutex);
+        memset(g_nv_samples, 0, sizeof(g_nv_samples));
+        g_nv_samples_tick = 0;
+        pthread_mutex_unlock(&g_nv_samples_mutex);
+        __atomic_store_n(&g_nv_samples_ready, 0, __ATOMIC_RELEASE);
     }
     __atomic_store_n(&g_nv_thread_running, 0, __ATOMIC_RELEASE);
     return NULL;
@@ -714,21 +735,36 @@ void gather_data(struct mon_data *d) {
 
     size = sizeof(itmp);
     if (sysctlbyname("hw.acpi.battery.state", &itmp, &size, NULL, 0) == 0) {
-        d->has_battery = 1;
-        /* hw.acpi.battery.state is a bitmask: bit0 discharging, bit1 charging, bit2 critical */
-        if (itmp == 0) {
-            strlcpy(d->bat_source, "AC Power", sizeof(d->bat_source));
-            strlcpy(d->bat_state, "Full", sizeof(d->bat_state));
-        } else {
-            strlcpy(d->bat_source, (itmp & 1) ? "Battery" : "AC Power", sizeof(d->bat_source));
-            if (itmp & 4)      strlcpy(d->bat_state, "Critical", sizeof(d->bat_state));
-            else if (itmp & 1) strlcpy(d->bat_state, "Discharging", sizeof(d->bat_state));
-            else if (itmp & 2) strlcpy(d->bat_state, "Charging", sizeof(d->bat_state));
-            else               strlcpy(d->bat_state, "Unknown", sizeof(d->bat_state));
-        }
-        size = sizeof(d->bat_life);
-        if (sysctlbyname("hw.acpi.battery.life", &d->bat_life, &size, NULL, 0) != 0)
+        if (itmp & ACPI_BATT_STAT_NOT_PRESENT) {
+            d->has_battery = 0;
             d->bat_life = -1;
+            strlcpy(d->bat_source, "AC Power", sizeof(d->bat_source));
+            strlcpy(d->bat_state, "No battery", sizeof(d->bat_state));
+        } else {
+            d->has_battery = 1;
+            size = sizeof(d->bat_life);
+            if (sysctlbyname("hw.acpi.battery.life", &d->bat_life, &size, NULL, 0) != 0)
+                d->bat_life = -1;
+            if ((itmp & ACPI_BATT_STAT_DISCHARG) && (itmp & ACPI_BATT_STAT_CHARGING)) {
+                strlcpy(d->bat_source, "AC Power", sizeof(d->bat_source));
+                strlcpy(d->bat_state, "Invalid", sizeof(d->bat_state));
+            } else if (itmp & ACPI_BATT_STAT_CRITICAL) {
+                strlcpy(d->bat_source, "Battery", sizeof(d->bat_source));
+                strlcpy(d->bat_state, "Critical", sizeof(d->bat_state));
+            } else if (itmp & ACPI_BATT_STAT_DISCHARG) {
+                strlcpy(d->bat_source, "Battery", sizeof(d->bat_source));
+                strlcpy(d->bat_state, "Discharging", sizeof(d->bat_state));
+            } else if (itmp & ACPI_BATT_STAT_CHARGING) {
+                strlcpy(d->bat_source, "AC Power", sizeof(d->bat_source));
+                strlcpy(d->bat_state, "Charging", sizeof(d->bat_state));
+            } else {
+                strlcpy(d->bat_source, "AC Power", sizeof(d->bat_source));
+                if (d->bat_life >= 100)
+                    strlcpy(d->bat_state, "Full", sizeof(d->bat_state));
+                else
+                    strlcpy(d->bat_state, "Idle", sizeof(d->bat_state));
+            }
+        }
     } else {
         d->has_battery = 0;
         d->bat_life = -1;
@@ -828,17 +864,23 @@ void gather_data(struct mon_data *d) {
 
         if (__atomic_load_n(&g_nv_samples_ready, __ATOMIC_ACQUIRE)) {
             struct nv_sample samples[MAX_GPUS];
+            unsigned int sample_tick;
+            pthread_mutex_lock(&g_nv_samples_mutex);
             memcpy(samples, g_nv_samples, sizeof(samples));
-            int nv_line = 0;
-            for (int i = 0; i < d->gpu_count; i++) {
-                if (!g_cache[i].is_nvidia) continue;
-                if (nv_line < MAX_GPUS && samples[nv_line].valid) {
-                    d->gpus[i].util_pct = samples[nv_line].util;
-                    d->gpus[i].vram_used_mib = samples[nv_line].mem_used;
-                    d->gpus[i].vram_total_mib = samples[nv_line].mem_total;
-                    d->gpus[i].temp_c = samples[nv_line].temp;
+            sample_tick = g_nv_samples_tick;
+            pthread_mutex_unlock(&g_nv_samples_mutex);
+            if (tick_count - sample_tick <= 10) {
+                int nv_line = 0;
+                for (int i = 0; i < d->gpu_count; i++) {
+                    if (!g_cache[i].is_nvidia) continue;
+                    if (nv_line < MAX_GPUS && samples[nv_line].valid) {
+                        d->gpus[i].util_pct = samples[nv_line].util;
+                        d->gpus[i].vram_used_mib = samples[nv_line].mem_used;
+                        d->gpus[i].vram_total_mib = samples[nv_line].mem_total;
+                        d->gpus[i].temp_c = samples[nv_line].temp;
+                    }
+                    nv_line++;
                 }
-                nv_line++;
             }
         }
 
@@ -1099,6 +1141,7 @@ static void render_system_box(struct mon_data *d, int box_top, int box_bot, int 
     if (d->pci_device_count >= 0) snprintf(buf, sizeof(buf), "%d devices", d->pci_device_count);
     else strlcpy(buf, "N/A", sizeof(buf));
     if (r < box_bot) print_val(r++, 3, col_w - 4, "PCI Devices:", buf);
+    if (g_privileged_note_visible && r < box_bot) print_val(r++, 3, col_w - 4, "Note:", g_privileged_note);
     if (d->pkg_count >= 0) snprintf(buf, sizeof(buf), "%d installed", d->pkg_count);
     else strlcpy(buf, "N/A", sizeof(buf));
     if (r < box_bot) print_val(r++, 3, col_w - 4, "pkg Packages:", buf);
@@ -1331,6 +1374,9 @@ int main() {
 #if MONBSD_X86
     if (g_cpuctl_fd < 0 || g_io_fd < 0) {
         fprintf(stderr, "monbsd: privileged CPU/I/O device access unavailable; some metrics will be disabled\n");
+        snprintf(g_privileged_note, sizeof(g_privileged_note),
+            "no /dev/cpuctl0 or /dev/io: CPU Temp/PCI via fallback");
+        g_privileged_note_visible = 1;
     }
 #endif
 

@@ -19,8 +19,10 @@ F = fix, H = hygiene).
   counters render "N/A" until a query succeeds.
 - **R3a/F3a:** powerd/powerdxx always showed "Stopped": detection read
   `/var/run/*.pid` (mode 0600, root-owned), unreadable after the privilege
-  drop. Reverted to an exact-name `kern.proc` sysctl scan — no subprocess,
-  unprivileged, immune to PID recycling.
+  drop. Reverted to an exact-name `kern.proc` sysctl scan - no subprocess,
+  unprivileged, immune to PID recycling. This works when
+  `security.bsd.see_other_uids=1`; with that disabled, non-root users may not
+  see root-owned `powerd` / `powerdxx`, and the UI can show "Stopped".
 - **F3b:** CPU temperature renders "N/A" instead of "-1.0 °C" when neither
   MSR (`cpuctl`) nor ACPI thermal zone telemetry exists.
 - **F3c:** Battery charge reads are validated (a failed

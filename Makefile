@@ -46,8 +46,8 @@ purge: uninstall clean
 
 install-user: ${TARGET}
 	@if [ -n "$$HOME" ]; then \
-		mkdir -p "$$HOME/.local/bin"; \
-		install -m 755 ${TARGET} "$$HOME/.local/bin/${TARGET}"; \
+		mkdir -p "$$HOME/.local/bin" && \
+		install -m 755 ${TARGET} "$$HOME/.local/bin/${TARGET}" && \
 		echo "installed (no setuid: MSR/PCI telemetry limited)"; \
 	else \
 		echo "\$$HOME is not set or empty; skipping user install."; \
