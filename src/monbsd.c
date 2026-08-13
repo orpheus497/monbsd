@@ -409,7 +409,12 @@ static FILE *popen_safe(const char *path, char *const argv[], pid_t *pid_out) {
     }
     close(pipe_fds[1]);
     *pid_out = pid;
-    return fdopen(pipe_fds[0], "r");
+    FILE *fp = fdopen(pipe_fds[0], "r");
+    if (fp == NULL) {
+        close(pipe_fds[0]);
+        (void)waitpid(pid, NULL, 0);
+    }
+    return fp;
 }
 
 static int pclose_safe(FILE *fp, pid_t pid) {
@@ -979,10 +984,11 @@ void gather_data(struct mon_data *d) {
     if (!disk_init || tick_count % 50 == 0) {
         cached_disk_count = 0;
         int nfs = getfsstat(NULL, 0, MNT_NOWAIT);
-        if (nfs > 0) {
-            struct statfs *fs = malloc(sizeof(struct statfs) * nfs);
+        if (nfs > 0 && (size_t)nfs <= SIZE_MAX / sizeof(struct statfs)) {
+            struct statfs *fs = malloc(sizeof(struct statfs) * (size_t)nfs);
             if (fs != NULL) {
-                nfs = getfsstat(fs, sizeof(struct statfs) * nfs, MNT_NOWAIT);
+                nfs = getfsstat(fs, sizeof(struct statfs) * (size_t)nfs, MNT_NOWAIT);
+                if (nfs < 0) nfs = 0;
                 const char *targets[] = {"/", "/boot/efi", "/tmp", "/zroot", d->home_path};
                 for (int j = 0; j < 5; j++) {
                     if (targets[j][0] == '\0') continue;
@@ -1321,6 +1327,12 @@ int main() {
             exit(1);
         }
     }
+
+#if MONBSD_X86
+    if (g_cpuctl_fd < 0 || g_io_fd < 0) {
+        fprintf(stderr, "monbsd: privileged CPU/I/O device access unavailable; some metrics will be disabled\n");
+    }
+#endif
 
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
         fprintf(stderr, "monbsd: stdin and stdout must be a terminal\n");
