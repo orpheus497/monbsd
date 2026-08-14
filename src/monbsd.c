@@ -60,18 +60,21 @@
  * Privilege model
  * ----------------
  * monbsd is normally installed setuid root (see Makefile's `install`
- * target) so it can open /dev/cpuctl0 and /dev/io. Anything that does
- * NOT need those privileges runs with the effective uid dropped back to
- * the real (invoking) uid first:
- *   - count_dir_executables() drops to the real uid before touching the
- *     invoking user's home directory, so a setuid process can't be used
- *     to probe files the real user could not otherwise read/execute.
+ * target) so it can open /dev/cpuctl0 and /dev/io, and it runs with an
+ * elevated effective uid for its entire lifetime - there is no global
+ * privilege drop in main(). Two narrower mechanisms limit the exposure
+ * that comes with that instead:
+ *   - count_dir_executables() temporarily drops the effective uid back
+ *     to the real (invoking) uid for the duration of each scan, so a
+ *     setuid process can't be used to probe files in the invoking
+ *     user's home directory that the user could not otherwise
+ *     read/execute; it restores the elevated euid afterwards (or exits
+ *     if it cannot).
  *   - popen_safe() permanently drops both uid and gid (via setresuid/
- *     setresgid) in the forked child *before* exec, so subprocesses like
- *     pkg(8) or pciconf(8) never run with root privileges.
- * Only the direct-hardware paths (direct_cpu_temp, direct_cpu_live_freq,
- * direct_pci_count) run with the elevated effective uid, and only for as
- * long as the corresponding /dev fd is open.
+ *     setresgid) in the forked child *before* exec, so subprocesses
+ *     like pkg(8) or pciconf(8) never run with root privileges. This
+ *     only affects the child; the parent (main) process's elevated
+ *     euid is unchanged by forking.
  *
  * Memory model
  * ------------

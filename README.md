@@ -49,15 +49,18 @@ package-count thread, data gathering, and rendering. See the file header comment
 `src/monbsd.c` for a full breakdown.
 
 Because `monbsd` reads CPU MSRs and PCI configuration space directly, it is normally installed
-setuid root. To minimize the exposure that comes with that:
+setuid root, and it runs with an elevated effective UID for its entire lifetime — there is no
+global privilege drop at startup. Two narrower mechanisms limit the exposure that comes with
+that instead:
 
 - Any operation that touches the invoking user's files (e.g. counting executables in
-  `~/.local/bin`) temporarily drops the effective UID back to the real UID first.
+  `~/.local/bin`) temporarily drops the effective UID back to the real UID for the duration of
+  that scan only, then restores it (or exits, rather than continuing at the wrong privilege
+  level, if the restore fails).
 - All subprocesses (`pkg`, `pciconf`, `swapinfo`, `nvidia-smi`) are launched with `fork`/`execv`
-  directly (never a shell), and the child permanently drops both UID and GID to the real,
-  unprivileged user before `exec`.
-- Only the direct `/dev/cpuctl0` and `/dev/io` accesses run with the elevated effective UID, and
-  only for as long as the corresponding file descriptor is open.
+  directly (never a shell), and the *forked child* permanently drops both UID and GID to the
+  real, unprivileged user before `exec` — this does not affect the main process's own elevated
+  UID.
 
 All string handling uses fixed-size buffers filled via `strlcpy()`/`snprintf()` (never
 `sprintf`/`strcpy`), and the only heap allocations on the data path are short-lived and freed on
