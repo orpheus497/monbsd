@@ -41,6 +41,28 @@ Press `q` to exit.
 
 `monbsd` is currently zero-config. It automatically detects hardware and network interfaces.
 
+## Architecture & Security Model
+
+`monbsd` is a single-source-file (`src/monbsd.c`) program, organized top to bottom into clearly
+commented sections: terminal control, direct hardware access, subprocess helpers, the background
+package-count thread, data gathering, and rendering. See the file header comment in
+`src/monbsd.c` for a full breakdown.
+
+Because `monbsd` reads CPU MSRs and PCI configuration space directly, it is normally installed
+setuid root. To minimize the exposure that comes with that:
+
+- Any operation that touches the invoking user's files (e.g. counting executables in
+  `~/.local/bin`) temporarily drops the effective UID back to the real UID first.
+- All subprocesses (`pkg`, `pciconf`, `swapinfo`, `nvidia-smi`) are launched with `fork`/`execv`
+  directly (never a shell), and the child permanently drops both UID and GID to the real,
+  unprivileged user before `exec`.
+- Only the direct `/dev/cpuctl0` and `/dev/io` accesses run with the elevated effective UID, and
+  only for as long as the corresponding file descriptor is open.
+
+All string handling uses fixed-size buffers filled via `strlcpy()`/`snprintf()` (never
+`sprintf`/`strcpy`), and the only heap allocations on the data path are short-lived and freed on
+every code path (see the "Memory model" note in `src/monbsd.c`).
+
 ## License
 
 This project is licensed under the 2-Clause BSD License. See the [LICENSE](LICENSE) file for details.
