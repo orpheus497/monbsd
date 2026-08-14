@@ -49,8 +49,9 @@
  *                          sysctl(3) queries, the helpers above, and a
  *                          small ring buffer (history[]) used to derive
  *                          rates (CPU%, network throughput) between ticks.
- *  5. Rendering          - stateless draw_*/print_*/render_*_box helpers
- *                          turn a struct mon_data snapshot into ANSI
+ *  5. Rendering          - stateless draw_box/print_val/print_bar and the
+ *                          render_*_box helpers turn a struct mon_data
+ *                          snapshot into ANSI
  *                          escape sequences; render() is the entry point.
  *  6. main()             - sanitizes the environment, resolves the
  *                          invoking (pre-sudo) user's home directory,
@@ -954,7 +955,7 @@ void gather_data(struct mon_data *d) {
 
 /* ============================== Rendering ============================== */
 /*
- * The draw_*/print_*/render_*_box functions below are pure output: they
+ * The draw_box/print_val/print_bar/render_*_box functions below are pure output: they
  * only read from `struct mon_data *d` and write ANSI escape sequences
  * to stdout, never allocating or mutating shared state. Every helper
  * takes an explicit width/height and clips its output to it (see the
