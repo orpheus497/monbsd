@@ -39,6 +39,74 @@
 #include <pthread.h>
 #include <sys/wait.h>
 
+/*
+ * monbsd - terminal-based system monitor for FreeBSD laptops.
+ *
+ * Architecture
+ * ------------
+ *  1. Terminal control  - raw-mode setup/teardown, cursor/color escapes,
+ *                          SIGWINCH-driven resize handling.
+ *  2. Hardware access   - direct MSR reads via /dev/cpuctl0 and raw PCI
+ *                          config-space I/O via /dev/io. Both descriptors
+ *                          must be opened with an elevated effective uid
+ *                          (see "Privilege model" below).
+ *  3. Subprocess helpers - privilege-dropping fork/exec wrappers used to
+ *                          invoke read-only system utilities (pkg,
+ *                          pciconf, swapinfo, nvidia-smi) without a shell.
+ *  4. Data gathering     - gather_data() populates a single, reused
+ *                          struct mon_data snapshot per tick by combining
+ *                          sysctl(3) queries, the helpers above, and a
+ *                          small ring buffer (history[]) used to derive
+ *                          rates (CPU%, network throughput) between ticks.
+ *  5. Rendering          - stateless draw_box/print_val/print_bar and the
+ *                          render_*_box helpers turn a struct mon_data
+ *                          snapshot into ANSI
+ *                          escape sequences; render() is the entry point.
+ *  6. main()             - sanitizes the environment, resolves the
+ *                          invoking (pre-sudo) user's home directory,
+ *                          acquires the privileged device descriptors,
+ *                          drops privileges, then drives the raw-mode
+ *                          render loop.
+ *
+ * Privilege model
+ * ----------------
+ * monbsd is normally installed setuid root (see the Makefile's `install`
+ * target) so that it can open /dev/cpuctl0 and /dev/io. Those two
+ * descriptors are opened once, early in main(), while the effective uid
+ * is still root, and with O_CLOEXEC so that no forked child inherits
+ * them. Because credentials are checked at open(2) time, the later
+ * RDMSR ioctls and I/O-port reads keep working once the descriptors are
+ * held. main() then permanently drops the effective, real and saved gid
+ * and uid back to the invoking user's (setresgid/setresuid) before the
+ * UI starts, and treats a failed drop as fatal - so the render loop does
+ * not run with an elevated effective uid.
+ *
+ * Note that the drop lowers privileges to the *real* uid, so when monbsd
+ * is genuinely invoked by root (via sudo, say) there is nothing to drop
+ * and the process legitimately stays root. Two narrower mechanisms limit
+ * exposure regardless of how the program was started:
+ *   - count_dir_executables() lowers the effective uid to the real uid
+ *     for the duration of each scan, so its file-access checks carry the
+ *     invoking user's authority rather than root's; it restores the
+ *     previous euid afterwards (or exits if it cannot).
+ *   - popen_safe() permanently drops both uid and gid (via setresuid/
+ *     setresgid) in the forked child *before* exec, so subprocesses like
+ *     pkg(8) or pciconf(8) never run with root privileges. This only
+ *     affects the child; the parent's credentials are unchanged.
+ *
+ * Memory model
+ * ------------
+ * There is no long-lived heap allocation on the hot path: struct
+ * mon_data is a single fixed-size, statically-sized instance owned by
+ * main() and passed by pointer; all string fields use fixed-size buffers
+ * filled with strlcpy()/snprintf() (never sprintf/strcpy). The only
+ * heap allocations are short-lived and always freed on every path:
+ * getfsstat()'s struct statfs array in gather_data(), and the TERM
+ * string duplicated in main(). The background threads
+ * (update_pkg_counts_thread, update_nvidia_thread) are created
+ * PTHREAD_CREATE_DETACHED, so they need no explicit join/cleanup.
+ */
+
 #define VERSION "0.1.2"
 #define HISTORY_SIZE 10
 #define MAX_DISKS 8
@@ -76,6 +144,13 @@ struct disk_entry {
     double usage;
 };
 
+/*
+ * A single point-in-time snapshot of everything the UI renders. Owned
+ * by main() as one persistent instance and refilled in place by
+ * gather_data() every tick (never reallocated) - see the "Memory
+ * model" note at the top of this file. All string members are
+ * fixed-size buffers written only through strlcpy()/snprintf().
+ */
 struct mon_data {
     char time_str[16];
     char date_str[16];
@@ -128,6 +203,14 @@ struct iface_history {
     int valid;
 };
 
+/*
+ * Fixed-size ring buffer of past CPU/network counters, used to derive
+ * rates (CPU load %, network KB/s) as a delta against a sample from
+ * `history[HISTORY_SIZE - 1]` ticks ago (see the `oidx` lookups in
+ * gather_data()). `valid` guards each slot until it has been written
+ * at least once, so early ticks (before the ring buffer has wrapped)
+ * skip rate calculations instead of reading uninitialized data.
+ */
 struct {
     long cp_time[CPUSTATES];
     struct iface_history ifaces[MAX_NET_IF];
@@ -142,6 +225,8 @@ int term_width = 120, term_height = 40;
 volatile sig_atomic_t resize_pending = 0;
 static volatile sig_atomic_t exit_signo = 0;
 unsigned int tick_count = 0;
+
+/* ===================== Terminal control & raw mode ===================== */
 
 void move_cursor(int y, int x) { printf("\033[%d;%dH", y, x); }
 void set_color(int color) { printf("\033[%dm", color); }
@@ -258,6 +343,11 @@ static void get_ip_address(struct ifaddrs *ifaddr, const char *ifname, char *ip_
     }
 }
 
+/* ========= Direct hardware access (via the pre-opened privileged fds) ========= */
+
+/* Logical processor (thread) count per package, from CPUID leaf 1 EBX[23:16],
+ * cached after the first successful read. Used only as a fallback when the
+ * kern.smp.cpus sysctl fails; returns >= 1 on x86 and 1 elsewhere. */
 int direct_cpu_cores() {
 #if MONBSD_X86
     static int cached_cores = 0;
@@ -273,6 +363,11 @@ int direct_cpu_cores() {
 #endif
 }
 
+/*
+ * CPU package temperature in degrees Celsius, or -1.0 if unavailable.
+ * Tries an MSR read via /dev/cpuctl0 first, falling back to the ACPI
+ * thermal-zone sysctl if the MSR path (or file) isn't available.
+ */
 double direct_cpu_temp() {
 #if MONBSD_X86
     if (g_cpuctl_fd >= 0) {
@@ -293,6 +388,14 @@ double direct_cpu_temp() {
     return -1.0;
 }
 
+/*
+ * Instantaneous CPU frequency (MHz) derived from the change in the
+ * APERF/MPERF MSR pair since the previous call. Returns fallback_freq
+ * on the first call (no prior sample) or if /dev/cpuctl0 is unavailable.
+ * Keeps its previous-sample state in static locals, so it is not
+ * reentrant/thread-safe; it is only ever called from gather_data() on
+ * the main thread.
+ */
 double direct_cpu_live_freq(double fallback_freq, double base_freq) {
 #if !MONBSD_X86
     (void)base_freq;
@@ -317,8 +420,19 @@ double direct_cpu_live_freq(double fallback_freq, double base_freq) {
     return fallback_freq;
 }
 
+/* Unprivileged, architecture-neutral fallback used below when the direct
+ * config-space scan is unavailable. */
 static int pciconf_pci_count(void);
 
+/*
+ * Counts populated PCI functions by brute-force scanning all 256 buses
+ * and 32 devices (plus up to 8 functions on multi-function devices)
+ * via raw CF8/CFC config-space I/O through the cached /dev/io
+ * descriptor. On non-x86 builds, or when /dev/io could not be opened,
+ * it falls back to pciconf_pci_count(); returns -1 if that fails too.
+ * This is a deliberately exhaustive scan, but not a hot-path call -
+ * gather_data() only invokes it every ~100 ticks.
+ */
 int direct_pci_count() {
 #if MONBSD_X86
     if (g_io_fd >= 0) {
@@ -351,6 +465,17 @@ int direct_pci_count() {
     return pciconf_pci_count();
 }
 
+/* ==================== Privilege-dropping helper functions ==================== */
+
+/*
+ * Counts executable regular files directly inside `path`. Temporarily
+ * drops the effective uid to the real (invoking) uid for the duration
+ * of the scan, so a setuid-root monbsd cannot be used to enumerate or
+ * probe files in the invoking user's home directory that the user
+ * themselves could not already access. Any failure to restore the
+ * original euid afterwards is treated as fatal (exit(1)) rather than
+ * silently continuing with the wrong privilege level.
+ */
 static int count_dir_executables(const char *path) {
     uid_t orig_euid = geteuid();
     uid_t ruid = getuid();
@@ -390,6 +515,19 @@ static int count_dir_executables(const char *path) {
     return count;
 }
 
+/* ========================= Subprocess helpers ========================= */
+
+/*
+ * popen(3)-like helper that execv()s `path` directly (no shell, so no
+ * shell-metacharacter injection risk) and permanently drops the child
+ * to the real uid/gid before exec, so subprocesses never inherit
+ * monbsd's setuid-root privilege. The child's stderr is redirected to
+ * /dev/null to avoid corrupting the parent's raw-mode terminal display.
+ * On success, returns a FILE* open for reading the child's stdout and
+ * stores its pid in *pid_out; the caller must eventually call
+ * pclose_safe() to reap the child and avoid a zombie process. Returns
+ * NULL on failure with no fd/resource left open.
+ */
 static FILE *popen_safe(const char *path, char *const argv[], pid_t *pid_out) {
     int pipe_fds[2];
     if (pipe(pipe_fds) == -1) return NULL;
@@ -418,6 +556,7 @@ static FILE *popen_safe(const char *path, char *const argv[], pid_t *pid_out) {
     return fp;
 }
 
+/* Closes a popen_safe() pipe and reaps its child, preventing zombies. */
 static int pclose_safe(FILE *fp, pid_t pid) {
     fclose(fp);
     int status;
@@ -441,6 +580,17 @@ static int pciconf_pci_count(void) {
     return count;
 }
 
+/* ===================== Background package-count thread ===================== */
+/*
+ * pkg(8) queries are slow enough to stall the render loop, so they run
+ * on a detached background thread every ~600 ticks (see pkg_ticks in
+ * gather_data()). g_pkg_count/g_ports_count/g_pkg_thread_running are
+ * the only state shared with the main thread, and all access to them
+ * goes through __atomic_*, so no mutex/join is required: the main
+ * thread just reads the last-published values each tick. Both counters
+ * start at -1, meaning "no successful query yet", and render as "N/A"
+ * until a query succeeds.
+ */
 static int g_pkg_count = -1;    /* -1 = no successful query yet (rendered N/A) */
 static int g_ports_count = -1;
 static int g_pkg_thread_running = 0;
@@ -547,6 +697,17 @@ static void *update_nvidia_thread(void *arg) {
     return NULL;
 }
 
+/* ============================ Data gathering ============================ */
+/*
+ * Refreshes every field of `d` for one render tick. Cheap sysctl(3)
+ * reads happen every tick; expensive operations (pkg counts, PCI scan,
+ * home-directory executable counts, GPU/swap/disk enumeration) are
+ * cached in function-local statics and refreshed only every N ticks or
+ * on the first call, to keep the render loop responsive. `d` is a
+ * single long-lived instance reused every tick, not reallocated, so
+ * fields that a given refresh path skips simply retain their previous
+ * value rather than being reset.
+ */
 void gather_data(struct mon_data *d) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
@@ -618,8 +779,11 @@ void gather_data(struct mon_data *d) {
     size = sizeof(active); sysctlbyname("vm.stats.vm.v_active_count", &active, &size, NULL, 0);
     size = sizeof(wire); sysctlbyname("vm.stats.vm.v_wire_count", &wire, &size, NULL, 0);
     size = sizeof(v_free); sysctlbyname("vm.stats.vm.v_free_count", &v_free, &size, NULL, 0);
-    d->mem_used = (long long)(active + wire) * pagesize;
-    d->mem_usage = 100.0 * d->mem_used / d->mem_total;
+    /* Widen to long long before adding to avoid unsigned-int wraparound
+     * on systems with an extreme page count, then guard mem_total==0
+     * (e.g. hw.physmem sysctl failed) to avoid a divide-by-zero. */
+    d->mem_used = ((long long)active + (long long)wire) * pagesize;
+    d->mem_usage = (d->mem_total > 0) ? (100.0 * d->mem_used / d->mem_total) : 0.0;
 
     static int pkg_ticks = 0;
     if (pkg_ticks-- <= 0) {
@@ -1066,6 +1230,15 @@ void gather_data(struct mon_data *d) {
     }
 }
 
+/* ============================== Rendering ============================== */
+/*
+ * The draw_box/print_val/print_bar/render_*_box functions below are pure output: they
+ * only read from `struct mon_data *d` and write ANSI escape sequences
+ * to stdout, never allocating or mutating shared state. Every helper
+ * takes an explicit width/height and clips its output to it (see the
+ * `w < N` / `r < box_bot` guards throughout), so a too-small terminal
+ * degrades to fewer visible rows rather than misrendering.
+ */
 void draw_box(int y, int x, int h, int w, const char *title) {
     if (w < 5) return;
     int tlen = strlen(title); if (tlen > w - 6) tlen = w - 6;
@@ -1292,6 +1465,14 @@ void render(struct mon_data *d) {
     render_network_disks_box(d, box_top, box_bot, h, col_w);
 }
 
+/* ================================ main ================================ */
+/*
+ * Resolves the invoking (pre-sudo) user's home directory and its mount
+ * point, sanitizes the environment down to a fixed PATH plus a
+ * validated TERM, then drives the raw-mode render loop until 'q' is
+ * pressed. Must run before enable_raw_mode()/gather_data() so that
+ * privilege-sensitive setup (env sanitization) happens first.
+ */
 int main() {
     char resolved_home[MAXPATHLEN] = "";
     char resolved_home_dir[MAXPATHLEN] = "";

@@ -77,6 +77,36 @@ make bench   # build the benchmarks
 
 `make check` includes x86-specific tests (`test_compile`, `test_cpuid`, `test_cpuctl`, `test_aperf`, and `test_pci`) that exercise the privileged telemetry paths.
 
+## Architecture & Security Model
+
+`monbsd` is a single-source-file (`src/monbsd.c`) program, organized top to bottom into clearly
+commented sections: terminal control, direct hardware access, subprocess helpers, the background
+package-count thread, data gathering, and rendering. See the file header comment in
+`src/monbsd.c` for a full breakdown.
+
+Because `monbsd` reads CPU MSRs and PCI configuration space directly, it is normally installed
+setuid root. It needs that privilege only at startup: `main()` opens `/dev/cpuctl0` and
+`/dev/io` while the effective UID is still root and marks both close-on-exec, then permanently
+drops the effective, real and saved UID and GID back to the invoking user via
+`setresgid()`/`setresuid()` before the UI starts. A failed drop is fatal, so the render loop
+never runs with an elevated effective UID. Because credentials are checked at `open(2)` time,
+MSR and PCI reads keep working through the retained descriptors.
+
+Since the drop targets the *real* UID, running `monbsd` as root (via `sudo`) legitimately leaves
+it as root. Two narrower mechanisms limit exposure regardless of how it was started:
+
+- Any operation that touches the invoking user's files (e.g. counting executables in
+  `~/.local/bin`) lowers the effective UID to the real UID for the duration of that scan only,
+  so the access checks carry the invoking user's authority, then restores it (or exits, rather
+  than continuing at the wrong privilege level, if the restore fails).
+- All subprocesses (`pkg`, `pciconf`, `swapinfo`, `nvidia-smi`) are launched with `fork`/`execv`
+  directly (never a shell), and the *forked child* permanently drops both UID and GID to the
+  real, unprivileged user before `exec` — this affects only the child, not the parent.
+
+All string handling uses fixed-size buffers filled via `strlcpy()`/`snprintf()` (never
+`sprintf`/`strcpy`), and the only heap allocations on the data path are short-lived and freed on
+every code path (see the "Memory model" note in `src/monbsd.c`).
+
 ## License
 
 This project is licensed under the 2-Clause BSD License. See the [LICENSE](LICENSE) file for details.

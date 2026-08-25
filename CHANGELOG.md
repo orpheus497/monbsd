@@ -2,6 +2,23 @@
 
 All notable changes to `monbsd` will be documented in this file.
 
+## [Unreleased]
+
+### Documentation
+- Added a file-level architecture/privilege-model/memory-model overview and section banners
+  throughout `src/monbsd.c`, plus doc comments on every non-trivial function and on the
+  `struct mon_data` / history ring-buffer data structures.
+- Documented the privilege-dropping and setuid-root security model in `README.md`.
+
+### Fixed
+- Guarded memory-usage percentage against a divide-by-zero (and resulting NaN display) when the
+  `hw.physmem` sysctl fails and `mem_total` is 0.
+- Filesystems reporting 0 total blocks are skipped during disk enumeration rather than being
+  listed with a percentage derived from a divide-by-zero.
+- Widened the active+wired page-count sum to `long long` before multiplying by the page size, to
+  avoid a theoretical 32-bit unsigned integer wraparound when computing `mem_used` on systems
+  with very large memory.
+
 ## [0.1.2] - 2026-08-12
 
 Regression restoration release. IDs reference PLAN.md (R = regression,
