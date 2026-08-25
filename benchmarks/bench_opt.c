@@ -11,6 +11,7 @@ void simulate_slow_subprocess() {
 int cached_pkg_count = 0;
 
 void *background_thread(void *arg) {
+    (void)arg;
     while (1) {
         simulate_slow_subprocess();
         cached_pkg_count = 1;

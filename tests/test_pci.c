@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <string.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdint.h>
@@ -13,6 +15,10 @@ uint32_t pci_read(int bus, int slot, int func, int offset) {
 int main() {
     int fd = open("/dev/io", O_RDWR);
     if (fd < 0) {
+        if (errno == EACCES || errno == EPERM || errno == ENOENT) {
+            fprintf(stderr, "SKIP: /dev/io unavailable: %s\n", strerror(errno));
+            return 77;
+        }
         perror("open /dev/io");
         return 1;
     }

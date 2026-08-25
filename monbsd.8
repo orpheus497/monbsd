@@ -1,4 +1,4 @@
-.Dd March 11, 2026
+.Dd August 12, 2026
 .Dt MONBSD 8
 .Os
 .Sh NAME
@@ -19,7 +19,7 @@ System uptime, load average, and CPU model.
 .It
 Real-time CPU and GPU temperatures.
 .It
-CPU frequency and core usage.
+CPU frequency and logical CPU (thread) count.
 .It
 Memory and swap usage.
 .It
@@ -31,6 +31,25 @@ ACPI states, battery status, and fan speed (where supported).
 .It
 Counts of installed packages and ports.
 .El
+.Sh ENVIRONMENT
+The environment is scrubbed with
+.Xr clearenv 3
+at startup.
+The following variables are honored or re-injected:
+.Bl -tag -width "SUDO_UID"
+.It Ev TERM
+The first 64 bytes are validated against the character set
+.Va [A-Za-z0-9._+-] .
+Values are truncated to 64 characters before being re-injected after
+scrubbing; invalid values are discarded.
+.It Ev PATH
+Reset to a fixed system list
+.Pq /bin:/usr/bin:/sbin:/usr/sbin:/usr/local/sbin:/usr/local/bin .
+.It Ev SUDO_UID
+Consulted to resolve the invoking user's home directory when run via
+.Xr sudo 8 .
+.El
+All other environment variables are cleared.
 .Sh FILES
 .Bl -tag -width "/dev/cpuctl0" -compact
 .It Pa /dev/cpuctl*
@@ -39,13 +58,83 @@ Used for direct MSR access to read CPU temperature and performance counters.
 Used for direct PCI configuration space access.
 .El
 .Sh PRIVILEGES
+For full telemetry,
 .Nm
-requires access to
+opens
 .Pa /dev/cpuctl0
 and
-.Pa /dev/io .
-It is typically installed with setuid root or must be run via
+.Pa /dev/io
+at startup, which requires root; it is typically installed setuid root or run
+via
 .Xr sudo 8 .
+Both descriptors are opened close-on-exec and, if the effective uid is 0,
+privileges are permanently dropped with
+.Xr setresgid 2
+and
+.Xr setresuid 2
+before the user interface starts; failure to drop is fatal (fail closed).
+The descriptors remain usable after the drop because credential checks happen
+at
+.Xr open 2
+time.
+.Pp
+When run without the ability to open those devices,
+.Nm
+continues with reduced telemetry: CPU temperature falls back to the ACPI
+thermal zone sysctl, live frequency falls back to
+.Va dev.cpu.0.freq ,
+and the PCI device count is enumerated with
+.Xr pciconf 8
+instead of direct configuration-space access.
+.Pp
+MSR-based temperatures, APERF/MPERF live frequency, and direct PCI counting
+require the amd64 or i386 architecture; other architectures build and run
+with reduced telemetry.
+MSR telemetry additionally requires the
+.Xr cpuctl 4
+module, which can be loaded with
+.Dq kldload cpuctl
+or via
+.Pa /boot/loader.conf .
+Without it, and without an ACPI thermal zone, CPU temperature is reported as
+.Dq N/A .
+.Sh TELEMETRY NOTES
+.Bl -dash -offset indent
+.It
+The
+.Dq Ports
+figure counts installed packages whose
+.Xr pkg 8
+repository name is exactly
+.Dq local ,
+i.e. packages installed from the ports tree outside any configured
+repository.
+Packages built by tools such as poudriere carry that builder's repository
+name and are not counted.
+The query is re-run roughly every 60 seconds; a failed query never
+overwrites the last known value, which is reported as
+.Dq N/A
+until a query succeeds.
+.It
+The PCI device count uses a direct configuration-space scan when
+.Pa /dev/io
+is open (amd64/i386, privileged), and otherwise falls back to
+.Xr pciconf 8 ,
+which works for any user on any architecture.
+The two enumerations may differ slightly (bridges, hot-plug visibility).
+.It
+.Xr powerd 8
+and powerdxx status are detected by an exact-name process scan via the
+.Va kern.proc
+sysctl.
+When run as a non-root user this requires the default
+.Va security.bsd.see_other_uids=1
+setting to see root-owned daemons.
+.It
+On machines without an ACPI battery the battery section reports
+.Dq No battery
+and the charge bar is hidden.
+.El
 .Sh INTERACTIVE COMMANDS
 The following keys can be used while
 .Nm
@@ -54,10 +143,22 @@ is running:
 .It Ic q, Q, Ctrl+C
 Exit the program.
 .El
+.Sh EXIT STATUS
+.Bl -tag -width "128+signo" -compact
+.It 0
+User quit
+.Pq Ic q , Ic Q , No or Ctrl+C .
+.It 1
+Startup failure (non-terminal stdin/stdout, environment sanitization failure,
+or privilege-drop failure).
+.It 128+signo
+Terminated by a signal; the terminal is restored before exiting.
+.El
 .Sh SEE ALSO
 .Xr sysctl 8 ,
 .Xr pciconf 8 ,
 .Xr pkg 8 ,
-.Xr powerd 8
+.Xr powerd 8 ,
+.Xr cpuctl 4
 .Sh AUTHORS
 .An orpheus497
