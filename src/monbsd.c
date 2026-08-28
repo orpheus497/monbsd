@@ -1512,7 +1512,7 @@ int main() {
     char *term = NULL;
     if (term_env != NULL) {
         int valid = 1;
-        for (int i = 0; term_env[i] != '\0' && i < 64; i++) {
+        for (int i = 0; i < 64 && term_env[i] != '\0'; i++) {
             char c = term_env[i];
             if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) &&
                 c != '-' && c != '_' && c != '.' && c != '+') {
