@@ -947,7 +947,6 @@ void gather_data(struct mon_data *d) {
         } g_cache[MAX_GPUS];
         static int g_cached_count = 0;
         static int g_init = 0;
-        static int has_nvidia_smi = -1;
 
         if (!g_init) {
             pid_t p_pid;
@@ -995,9 +994,6 @@ void gather_data(struct mon_data *d) {
                 if (pclose_safe(fp, p_pid) != 0)
                     g_cached_count = 0;   /* discard partial scan on failure */
             }
-            if (has_nvidia_smi < 0) {
-                has_nvidia_smi = (access(NVIDIA_SMI_PATH, X_OK) == 0) ? 1 : 0;
-            }
             g_init = 1;
         }
         d->gpu_count = g_cached_count;
@@ -1013,7 +1009,7 @@ void gather_data(struct mon_data *d) {
         for (int i = 0; i < d->gpu_count; i++)
             if (g_cache[i].is_nvidia) { have_nvidia = 1; break; }
 
-        if (has_nvidia_smi && have_nvidia && tick_count % 5 == 0 &&
+        if (have_nvidia && tick_count % 5 == 0 &&
             __atomic_load_n(&g_nv_thread_running, __ATOMIC_ACQUIRE) == 0) {
             __atomic_store_n(&g_nv_thread_running, 1, __ATOMIC_RELEASE);
             pthread_t t;
