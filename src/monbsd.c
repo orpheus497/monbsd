@@ -1080,10 +1080,17 @@ void gather_data(struct mon_data *d) {
     int ifc = 0; size = sizeof(ifc); sysctlbyname("net.link.generic.system.ifcount", &ifc, &size, NULL, 0);
     d->if_count = 0;
 
-    struct ifaddrs *ifaddr = NULL;
-    if (getifaddrs(&ifaddr) == -1) {
-        ifaddr = NULL; // Ensure it's NULL if it fails, although getifaddrs usually doesn't touch it on failure
+    static struct ifaddrs *cached_ifaddr = NULL;
+    if (cached_ifaddr == NULL || tick_count % 50 == 0) {
+        if (cached_ifaddr != NULL) {
+            freeifaddrs(cached_ifaddr);
+            cached_ifaddr = NULL;
+        }
+        if (getifaddrs(&cached_ifaddr) == -1) {
+            cached_ifaddr = NULL;
+        }
     }
+    struct ifaddrs *ifaddr = cached_ifaddr;
 
     for (int i = 1; i <= ifc && d->if_count < MAX_NET_IF; i++) {
         int mib[6] = {CTL_NET, PF_LINK, NETLINK_GENERIC, IFMIB_IFDATA, i, IFDATA_GENERAL};
@@ -1128,10 +1135,6 @@ void gather_data(struct mon_data *d) {
             }
             d->if_count++;
         }
-    }
-
-    if (ifaddr != NULL) {
-        freeifaddrs(ifaddr);
     }
 
     int oidx = (hist_idx + 1) % HISTORY_SIZE;
