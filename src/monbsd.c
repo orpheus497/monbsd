@@ -439,7 +439,7 @@ int direct_pci_count() {
         int count = 0;
         for (int bus = 0; bus < 256; bus++) {
             for (int dev = 0; dev < 32; dev++) {
-                uint32_t address = (1 << 31) | (bus << 16) | (dev << 11) | 0;
+                uint32_t address = (1 << 31) | (bus << 16) | (dev << 11);
                 outl(0xCF8, address);
                 uint32_t val = inl(0xCFC);
                 if (val != 0xFFFFFFFF && val != 0) {
