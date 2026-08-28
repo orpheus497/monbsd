@@ -200,7 +200,6 @@ struct iface_history {
     char name[32];
     long long rx, tx;
     struct timespec ts;
-    int valid;
 };
 
 /*
