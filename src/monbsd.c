@@ -811,7 +811,7 @@ void gather_data(struct mon_data *d) {
         if (dir) { struct dirent *e; while ((e = readdir(dir))) if (e->d_name[0] != '.') d->linux_count++; closedir(dir); }
 
         static int cached_pci_count = -1;
-        if (cached_pci_count == -1 || tick_count % 100 == 0) {
+        if (cached_pci_count == -1) {
             int current_count = direct_pci_count();
             if (current_count >= 0) {
                 cached_pci_count = current_count;
