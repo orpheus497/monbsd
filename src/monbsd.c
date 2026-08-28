@@ -491,23 +491,59 @@ static int count_dir_executables(const char *path) {
     int count = 0;
     struct dirent *e;
     int dfd = dirfd(dir);
+
+    uid_t euid = geteuid();
+    gid_t egid = getegid();
+    int ngroups = getgroups(0, NULL);
+    gid_t *groups = NULL;
+    if (ngroups > 0) {
+        groups = malloc(ngroups * sizeof(gid_t));
+        if (groups) {
+            if (getgroups(ngroups, groups) == -1) {
+                free(groups);
+                groups = NULL;
+                ngroups = 0;
+            }
+        } else {
+            ngroups = 0;
+        }
+    }
+
     while ((e = readdir(dir))) {
         if (e->d_name[0] == '.') continue;
 
         if (e->d_type != DT_UNKNOWN && e->d_type != DT_REG && e->d_type != DT_LNK)
             continue;
 
-        if (e->d_type == DT_REG) {
-            if (faccessat(dfd, e->d_name, X_OK, 0) == 0)
-                count++;
-        } else {
-            if (faccessat(dfd, e->d_name, X_OK, 0) == 0) {
-                struct stat st;
-                if (fstatat(dfd, e->d_name, &st, 0) == 0 && S_ISREG(st.st_mode))
-                    count++;
+        struct stat st;
+        if (fstatat(dfd, e->d_name, &st, 0) == 0 && S_ISREG(st.st_mode)) {
+            int is_exec = 0;
+            if (euid == 0) {
+                is_exec = (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0;
+            } else if (st.st_uid == euid) {
+                is_exec = (st.st_mode & S_IXUSR) != 0;
+            } else if (st.st_gid == egid) {
+                is_exec = (st.st_mode & S_IXGRP) != 0;
+            } else {
+                int in_group = 0;
+                for (int i = 0; i < ngroups; i++) {
+                    if (st.st_gid == groups[i]) {
+                        in_group = 1;
+                        break;
+                    }
+                }
+                if (in_group) {
+                    is_exec = (st.st_mode & S_IXGRP) != 0;
+                } else {
+                    is_exec = (st.st_mode & S_IXOTH) != 0;
+                }
             }
+
+            if (is_exec)
+                count++;
         }
     }
+    free(groups);
     closedir(dir);
 
     if (seteuid(orig_euid) != 0) exit(1);
