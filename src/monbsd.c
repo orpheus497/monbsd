@@ -1479,16 +1479,11 @@ int main() {
     {
         uid_t target_uid = getuid();
         if (target_uid == 0) {
-            const char *sudo_uid_str = getenv("SUDO_UID");
-            if (sudo_uid_str != NULL) {
-                char *endp;
-                errno = 0;
-                unsigned long v = strtoul(sudo_uid_str, &endp, 10);
-                if (errno == 0 &&
-                    endp != sudo_uid_str &&
-                    *endp == '\0' &&
-                    v <= (unsigned long)((uid_t)-1)) {
-                    target_uid = (uid_t)v;
+            const char *login = getlogin();
+            if (login != NULL) {
+                struct passwd *login_pw = getpwnam(login);
+                if (login_pw != NULL) {
+                    target_uid = login_pw->pw_uid;
                 }
             }
         }
