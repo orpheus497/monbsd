@@ -133,7 +133,6 @@ struct net_iface_data {
     double rx_rate_kb, tx_rate_kb;
     double total_rx_gb, total_tx_gb;
     int is_wifi;
-    char ssid[64];
     int active;
 };
 
@@ -277,57 +276,6 @@ static void sanitize_str(char *s) {
         unsigned char c = (unsigned char)*s;
         if (c < 0x20 || c == 0x7f) *s = ' ';
     }
-}
-
-struct ssid_cache_entry {
-    char name[32];
-    char ssid[64];
-    unsigned int last_tick;
-};
-static struct ssid_cache_entry g_ssid_cache[MAX_NET_IF];
-static int g_ssid_cache_count = 0;
-
-static struct ssid_cache_entry *ssid_cache_lookup(const char *name) {
-    for (int i = 0; i < g_ssid_cache_count; i++)
-        if (strcmp(g_ssid_cache[i].name, name) == 0)
-            return &g_ssid_cache[i];
-    return NULL;
-}
-
-static void ssid_cache_store(const char *name, const char *ssid, unsigned int tick) {
-    struct ssid_cache_entry *e = ssid_cache_lookup(name);
-    if (e == NULL && g_ssid_cache_count < MAX_NET_IF)
-        e = &g_ssid_cache[g_ssid_cache_count++];
-    if (e != NULL) {
-        strlcpy(e->name, name, sizeof(e->name));
-        strlcpy(e->ssid, ssid, sizeof(e->ssid));
-        e->last_tick = tick;
-    }
-}
-
-static void refresh_wifi_ssid(const char *ifname, char *out, size_t out_len) {
-    if (out_len == 0) return;
-    out[0] = '\0';
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0) return;
-    struct ieee80211req ireq;
-    char buf[64];
-    memset(&ireq, 0, sizeof(ireq));
-    memset(buf, 0, sizeof(buf));
-    strlcpy(ireq.i_name, ifname, sizeof(ireq.i_name));
-    ireq.i_type = IEEE80211_IOC_SSID;
-    ireq.i_val = -1;
-    ireq.i_data = buf;
-    ireq.i_len = sizeof(buf);
-    if (ioctl(s, SIOCG80211, &ireq) == 0 && ireq.i_len > 0) {
-        size_t n = (size_t)ireq.i_len;
-        if (n >= sizeof(buf)) n = sizeof(buf) - 1;
-        if (n >= out_len) n = out_len - 1;
-        memcpy(out, buf, n);
-        out[n] = '\0';
-        sanitize_str(out);
-    }
-    close(s);
 }
 
 static void get_ip_address(struct ifaddrs *ifaddr, const char *ifname, char *ip_buf, size_t buf_size) {
@@ -1100,18 +1048,6 @@ void gather_data(struct mon_data *d) {
             d->ifaces[d->if_count].total_tx_gb = ifmd.ifmd_data.ifi_obytes / (1024.0*1024.0*1024.0);
             d->ifaces[d->if_count].is_wifi = (strncmp(ifmd.ifmd_name, "wlan", 4) == 0);
             d->ifaces[d->if_count].active = 1;
-            d->ifaces[d->if_count].ssid[0] = '\0';
-            if (d->ifaces[d->if_count].is_wifi) {
-                struct ssid_cache_entry *se = ssid_cache_lookup(ifmd.ifmd_name);
-                if (se == NULL || tick_count - se->last_tick >= 50) {
-                    char ssid_buf[64];
-                    refresh_wifi_ssid(ifmd.ifmd_name, ssid_buf, sizeof(ssid_buf));
-                    ssid_cache_store(ifmd.ifmd_name, ssid_buf, tick_count);
-                    se = ssid_cache_lookup(ifmd.ifmd_name);
-                }
-                if (se != NULL)
-                    strlcpy(d->ifaces[d->if_count].ssid, se->ssid, sizeof(d->ifaces[d->if_count].ssid));
-            }
             
             int oidx = (hist_idx + 1) % HISTORY_SIZE;
             if (history[oidx].valid) {
@@ -1422,8 +1358,6 @@ static void render_network_disks_box(struct mon_data *d, int box_top, int box_bo
         snprintf(n_buf, sizeof(n_buf), "NET: %s (%s)", d->ifaces[i].name, d->ifaces[i].is_wifi ? "WiFi" : "Ethernet");
         draw_heading(r++, c3x + 2, c3inner, 36, n_buf);
         if (r < box_bot) print_val(r++, c3x + 2, c3inner, "IP:", d->ifaces[i].ip);
-        if (d->ifaces[i].is_wifi && d->ifaces[i].ssid[0] != '\0' && r < box_bot)
-            print_val(r++, c3x + 2, c3inner, "SSID:", d->ifaces[i].ssid);
         snprintf(buf, sizeof(buf), "%.2f KB/s", d->ifaces[i].rx_rate_kb);
         if (r < box_bot) print_val(r++, c3x + 2, c3inner, "Down:", buf);
         snprintf(buf, sizeof(buf), "%.2f KB/s", d->ifaces[i].tx_rate_kb);
